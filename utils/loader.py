@@ -46,7 +46,7 @@ def load_emoji(emoji, **kwargs):
     code_points = [f"{ord(c):04x}" for c in emoji]
     code = '_'.join(code_points)
     url = f'https://github.com/googlefonts/noto-emoji/blob/main/png/512/emoji_u{code}.png?raw=true'
-    print(f'{url = }')
+    # print(f'{url = }')
     return load_image(url, **kwargs)
 
 def load_target_image(target_str: str, **kwargs):
