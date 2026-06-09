@@ -3,6 +3,7 @@
 [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://selforg-npa.github.io/)
 [![arXiv](https://img.shields.io/badge/arXiv-2601.16096-b31b1b)](https://arxiv.org/abs/2601.16096)
 [![SIGGRAPH 2026](https://img.shields.io/badge/SIGGRAPH-2026-green)]()
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/TheDevilWillBeBee/NPA/blob/main/notebooks/growing.ipynb)
 
 ![Teaser](data/teaser.jpg)
 
@@ -37,6 +38,7 @@ python3 train.py --config configs/growing.yaml
 python3 train.py --config configs/texture.yaml
 ```
 
+You can also run the growing experiment end-to-end in your browser (no local setup) via the Colab notebook: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/TheDevilWillBeBee/NPA/blob/main/notebooks/growing.ipynb)
 ## Web Demo
 
 To deploy trained models on the interactive web demo, see [SelfOrg-NPA/SelfOrg-NPA.github.io](https://github.com/SelfOrg-NPA/SelfOrg-NPA.github.io).
@@ -54,6 +56,6 @@ The transparent texture dataset can be [downloaded here](https://drive.google.co
 
 ## TODO
 
-- [ ] Google Colab notebook
+- [x] Google Colab notebook
 - [ ] Self-classifying particles experiment
 - [ ] Growing a 3D morphology using Gaussian splats
