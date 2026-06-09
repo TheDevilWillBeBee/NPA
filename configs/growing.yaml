@@ -1,0 +1,85 @@
+experiment_name: "growing"
+device: "cuda:0"
+rng_seed: 42
+
+hashgrid: 
+  dim: 2
+  boundary: "clamped"
+  mode: "grid"
+  grid_size: [16, 16]
+  eps: 0.1
+  max_particles_per_block: 32
+
+npa:
+  graft_path: null # Random weight initialization
+  # graft_path: "data/pretrained/lizard.pth" # Start from a pretrained model
+  kwargs:
+    state_dims: 16
+    hidden_dims: 128
+    eps0: 0.1
+    alpha: 0.5
+
+pool:
+  pool_size: 512
+  num_particles: 4096
+  sigma: 0.2
+  noise_level: 0.0
+  seed_mode: "uniform_circle"
+  random_seed: 42
+
+train:
+  epochs: 10000                      # Number of epochs
+  batch_size: 8                      # Batch size
+  step_range: [32, 96]               # Number of update steps during training is sampled randomly from this range
+  inject_seed_interval: 16           # Number of steps after which a seed state is injected into the pool
+  adaptive_inject: False
+  summary_interval: 100              # Interval for logging the training summary
+  num_repetitions: 3                 # Number of times to flush the pool and repeat the training process
+  noise_std: 0.0
+  brush_size: 0.1
+  update_prob: 0.5
+  
+  stability_check_steps: 4096
+  stability_check_interval: 500
+  
+  
+
+  optimizer:
+    name: AdamW
+    kwargs:
+      lr: 0.0005
+      weight_decay: 0
+  
+  scheduler:
+    name: MultiStepLR
+    kwargs:
+      milestones: [2000, 4000, 6000, 8000]
+      gamma: 0.3
+
+  target: 
+    path: '🦎'                           # URL, Path, or Emoji
+    aabb: [-1, 1, -1, 1]                 # minx, maxx, miny, maxy
+    # image_size: [128, 128]
+    image_size: null                     # use num_points to determine the image size
+    threshold: 0.05
+    num_points: 4096                     # Set the image size so that number of points is as close as to 4096
+  
+  
+  loss:
+    splat_loss_weight: 2.0
+    displacement_regularizer_weight: 0.01 
+    overflow_regularizer_weight: 100.0
+    bound_regularizer_weight: 100.0
+
+    splat_loss_kwargs:
+      density_loss_weight: 1.0
+      color_loss_weight: 5.0
+      lpips_loss_weight: 0.0
+      grid_size: 256
+      sigma: 1.0
+      lo: -1.0
+      hi: 1.0
+      center: True
+  
+  logger:
+    backend: local

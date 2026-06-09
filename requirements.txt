@@ -1,0 +1,6 @@
+torch
+torchvision
+nanobind
+pyyaml
+tqdm
+requests
