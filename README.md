@@ -16,7 +16,7 @@ pip install -r requirements.txt
 
 ### Compiling the CUDA kernels
 
-We use [nanobind](https://github.com/wjakob/nanobind) to bind the SPH CUDA kernels.
+We use [nanobind](https://github.com/wjakob/nanobind) to bind the CUDA kernels.
 
 ```bash
 cd sphops
