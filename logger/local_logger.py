@@ -11,31 +11,33 @@ from .base import BaseLogger, ImageDataType
 
 
 class LocalLogger(BaseLogger):
-    def __init__(self, experiments_dir: str = "experiments", **kwargs):
+    def __init__(self, experiments_dir: str = "experiments", run_dir: str = None, **kwargs):
         super().__init__(**kwargs)
         self.experiments_dir = experiments_dir
+        self.run_dir = run_dir
         self.current_run_dir = None
         self.run_name = None
-        self.metrics_log = []
-        
-        # Create experiments directory if it doesn't exist
-        os.makedirs(self.experiments_dir, exist_ok=True)
+        self.metrics_file = None
+
+        if self.run_dir is None:
+            os.makedirs(self.experiments_dir, exist_ok=True)
     
     def start_run(self, run_name: str = None):
         if run_name is None:
             run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         self.run_name = run_name
-        self.current_run_dir = os.path.join(self.experiments_dir, run_name)
+        self.current_run_dir = self.run_dir or os.path.join(self.experiments_dir, run_name)
         
         # Create run directory and subdirectories
         os.makedirs(self.current_run_dir, exist_ok=True)
         os.makedirs(os.path.join(self.current_run_dir, "artifacts"), exist_ok=True)
         os.makedirs(os.path.join(self.current_run_dir, "images"), exist_ok=True)
         os.makedirs(os.path.join(self.current_run_dir, "models"), exist_ok=True)
-        
-        self.metrics_log = []
-        
+
+        # Append-only JSONL stream: one metric per line, O(1) per write.
+        self.metrics_file = open(os.path.join(self.current_run_dir, "metrics.jsonl"), "a")
+
         # Log run start time
         with open(os.path.join(self.current_run_dir, "run_info.json"), "w") as f:
             json.dump({
@@ -64,23 +66,23 @@ class LocalLogger(BaseLogger):
     def log_metric(self, key: str, value: float, step: int = None):
         if self.current_run_dir is None:
             raise RuntimeError("No active run. Call start_run() first.")
-        
+
         metric_entry = {
             "key": key,
             "value": value,
             "step": step,
             "timestamp": datetime.now().isoformat()
         }
-        
-        self.metrics_log.append(metric_entry)
-        
-        # Save metrics log
-        with open(os.path.join(self.current_run_dir, "metrics.json"), "w") as f:
-            json.dump(self.metrics_log, f, indent=2)
+
+        # Append a single line instead of rewriting the whole log every call.
+        self.metrics_file.write(json.dumps(metric_entry) + "\n")
 
     def log_metrics(self, kv: dict, step: int = None):
         for key, value in kv.items():
             self.log_metric(key, value, step)
+        # Flush once per step so the file stays current for live monitoring.
+        if self.metrics_file is not None:
+            self.metrics_file.flush()
 
     def log_artifact(self, local_path: str, artifact_path: str = None):
         if self.current_run_dir is None:
@@ -190,6 +192,10 @@ class LocalLogger(BaseLogger):
         
         with open(run_info_file, "w") as f:
             json.dump(run_info, f, indent=2)
-        
+
+        if self.metrics_file is not None:
+            self.metrics_file.close()
+            self.metrics_file = None
+
         self.current_run_dir = None
         self.run_name = None
