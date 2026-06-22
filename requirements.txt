@@ -4,3 +4,9 @@ nanobind
 pyyaml
 tqdm
 requests
+
+# For 3DGS
+setuptools
+wheel
+gsplat
+pytorch-msssim

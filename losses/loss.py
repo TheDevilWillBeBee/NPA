@@ -9,6 +9,19 @@ from .texture_loss import TextureLoss
 
 from .regularizer import *
 
+def import_loss(name, cls=None):
+    import importlib
+
+    module_name = name
+    class_name = utils.snake_to_pascal(name) if cls is None else cls
+
+    try:
+        module = importlib.import_module(f'.{module_name}', package=__package__)
+        loss_cls = getattr(module, class_name, None)
+        return loss_cls
+    except ModuleNotFoundError:
+        return None
+
 class Loss(torch.nn.Module):
     def __init__(self, target, **kwargs):
         super().__init__()
@@ -30,6 +43,7 @@ class Loss(torch.nn.Module):
     def _get_loss_module(self, name, target, kwargs=None):
         loss_module = globals().get(name, None) 
         loss_module = globals().get(utils.snake_to_pascal(name), None) if loss_module is None else loss_module
+        loss_module = import_loss(name) if loss_module is None else loss_module
         assert loss_module is not None, f'Loss module `{name}` not found!'
         
         if inspect.isfunction(loss_module):

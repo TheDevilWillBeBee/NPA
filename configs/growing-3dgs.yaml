@@ -1,0 +1,97 @@
+experiment_name: "morphogenesis-3dgs"
+device: "cuda:0"
+rng_seed: 42
+
+hashgrid: 
+  dim: 3
+  boundary: "clamped"
+  mode: "particle"
+  grid_size: [32, 32, 32]
+  eps: 0.1
+  max_particles_per_block: 64
+
+npa:
+  graft_path: null
+  kwargs:
+    state_dims: 16
+    hidden_dims: 256
+    eps0: 0.1
+    decoder_dims: 256
+    output_dims: 20
+
+gaussian_splat:
+  sigma: 0.02
+  max_anisotropy: 0.1
+  opacity_scale: 0.15
+  sh_degrees: 1
+
+pool:
+  pool_size: 16
+  num_particles: 16384
+  sigma: 1.0
+  seed_mode: "uniform_circle"
+  random_seed: 42
+
+train:
+  epochs: 20000                      # Number of epochs
+  batch_size: 4                     # Batch size - CHANGE HERE for reducing VRAM footprint
+  step_range: [ 16, 32 ]            # Number of update steps during training is sampled randomly from this range
+  inject_seed_interval: 1          # Number of steps after which a seed state is injected into the pool
+  summary_interval: 50             # Interval for logging the training summary
+  num_repetitions: 1               # Number of times to flush the pool and repeat the training process
+  noise_std: 0.0
+  
+  validation:
+    target: 
+      rootdir: ./data/nerf_synthetic/lego # NOT INCLUDED IN THE REPO
+      train: False
+      resize: [512, 512]
+    interval: 1000
+    batch_size: 4
+    step_range: [ 128, 129 ]
+    loss:
+      gaussian_splat_3d_loss_weight: 1.0
+      gaussian_splat_3d_loss_kwargs:
+        color_loss_weight: 1.0
+        alpha_loss_weight: 1.0
+        isotropy_regularization_weight: 0.0
+        alpha_normalize: False
+        random_background: False
+        # num_views: 16
+
+  optimizer:
+    name: AdamW
+    kwargs:
+      lr: 0.001
+      weight_decay: 0.0
+
+  scheduler:
+    name: MultiStepLR
+    kwargs:
+      milestones: [2000, 10000]
+      gamma: 0.3
+
+  target: 
+    rootdir: ./data/nerf_synthetic/lego # NOT INCLUDED IN THE REPO
+    train: True
+    resize: [256, 256]
+  
+  loss:
+    gaussian_splat_3d_loss_weight: 2.0
+    displacement_regularizer_weight: 0.01
+    overflow_regularizer_weight: 10.0
+    bound_regularizer_weight: 10.0
+
+    gaussian_splat_3d_loss_kwargs:
+      color_loss_weight: 5.0
+      alpha_loss_weight: 1.0
+      isotropy_regularization_weight: 0.5
+      alpha_normalize: True
+      random_background: True
+      target_initial_sigma: 20
+      target_final_sigma_t: 0.05
+      regularizer_fn: l1_loss
+      photometric_loss_lambda: 0.2
+  
+  logger:
+    backend: local

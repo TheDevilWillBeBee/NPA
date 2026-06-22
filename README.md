@@ -36,6 +36,7 @@ python3 test.py
 ```bash
 python3 train.py --config configs/growing.yaml
 python3 train.py --config configs/texture.yaml
+python3 train_3dgs.py --config configs/growing-3dgs.yaml
 ```
 
 You can also run the growing experiment end-to-end in your browser (no local setup) via the Colab notebook: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/TheDevilWillBeBee/NPA/blob/main/notebooks/growing.ipynb)
@@ -58,4 +59,4 @@ The transparent texture dataset can be [downloaded here](https://drive.google.co
 
 - [x] Google Colab notebook
 - [ ] Self-classifying particles experiment
-- [ ] Growing a 3D morphology using Gaussian splats
+- [x] Growing a 3D morphology using Gaussian splats
