@@ -10,3 +10,6 @@ setuptools
 wheel
 gsplat
 pytorch-msssim
+
+# For PointMNIST generation
+fpsample
