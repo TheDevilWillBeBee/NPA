@@ -1,0 +1,78 @@
+experiment_name: "point-mnist"
+device: "cuda:0"
+rng_seed: 42
+
+hashgrid: 
+  dim: 2
+  boundary: "clamped"
+  mode: "grid"
+  grid_size: [16,16]
+  eps: 0.1
+  max_particles_per_block: 64
+
+npa:
+  kwargs:
+    state_dims: 16
+    hidden_dims: 256
+    eps0: 0.1
+    decoder_dims: 256
+    output_dims: 10
+
+pool:
+  pool_size: 1024
+  num_particles: 512
+
+train:
+  epochs: 50000
+  batch_size: 64
+  step_range: [ 12, 24 ]            # Number of update steps during training is sampled randomly from this range
+  # inject_seed_interval: 1          # Number of steps after which a seed state is injected into the pool
+  summary_interval: 100             # Interval for logging the training summary
+  num_repetitions: 1               # Number of times to flush the pool and repeat the training process
+  # noise_std: 0.001
+
+  use_pool: True
+  mutate_pool: False
+  stochastic_update: True
+
+  validation:
+    interval: 100
+    model_log_interval: 10000
+    batch_size: 200
+    step_range: [64, 65]
+    loss:
+      pointwise_loss_weight: 1.0
+      pointwise_loss_kwargs:
+        output_dims: "-10:"
+        loss_type: l1_loss
+      pointwise_accuracy_weight: 1.0
+      pointwise_accuracy_kwargs:
+        output_dims: "-10:"
+  
+  optimizer:
+    name: AdamW
+    kwargs:
+      lr: 0.001
+      weight_decay: 0.1
+  
+  scheduler:
+    name: MultiStepLR
+    kwargs:
+      milestones: [20000, 40000]
+      gamma: 0.3
+
+  dataset:
+    name: point_mnist
+    kwargs:
+      rootdir: "./data/"
+      num_points: 512
+  
+  loss:
+    overflow_regularizer_weight: 1.0
+    pointwise_loss_weight: 1.0
+    pointwise_loss_kwargs:
+      output_dims: "-10:"
+      loss_type: mse_loss
+  
+  logger:
+    backend: local
