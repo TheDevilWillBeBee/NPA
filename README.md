@@ -36,8 +36,12 @@ python3 test.py
 ```bash
 python3 train.py --config configs/growing.yaml
 python3 train.py --config configs/texture.yaml
-python3 train_3dgs.py --config configs/growing-3dgs.yaml
+python3 train_dataset.py --config configs/point_mnist.yaml
+python3 train_3dgs.py --config configs/growing-3dgs.yaml # Download dataset first
 ```
+
+All training configs except `growing-3dgs.yaml` can run on RTX 2080 with 8GB VRAM.
+For `growing-3dgs.yaml`, reduce `batch_size` in the config to fit in the small VRAM GPUs.
 
 You can also run the growing experiment end-to-end in your browser (no local setup) via the Colab notebook: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/TheDevilWillBeBee/NPA/blob/main/notebooks/growing.ipynb)
 ## Web Demo
@@ -55,8 +59,13 @@ Set `graft_path` in your config to one of these models to improve training stabi
 
 The transparent texture dataset can be [downloaded here](https://drive.google.com/file/d/1awJVK4m94qKkfc8jWLbR20OKjFL-52sh/view?usp=sharing) and should be placed in `data/transparent_textures`.
 
+For 3DGS morphogenesis, `nerf-synthetic` dataset can be [downloaded here](https://www.matthewtancik.com/nerf) and should be placed in `data/nerf_synthetic`. 
+
+For PointMNIST classification, the code will automatically download MNIST dataset and convert to PointMNIST on the first run.
+Later runs will use cached PointMNIST dataset saved in `data/point-MNIST-512`.
+
 ## TODO
 
 - [x] Google Colab notebook
-- [ ] Self-classifying particles experiment
+- [x] Self-classifying particles experiment
 - [x] Growing a 3D morphology using Gaussian splats
