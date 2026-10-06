@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.18...3.27)  # Increased minimum for CUDA support
 
-set(CMAKE_CUDA_ARCHITECTURES 75 80 86)
+if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 75 80 86 89)
+endif()
 
 project(my_project LANGUAGES CXX CUDA)  # Added CUDA language
 
@@ -36,7 +38,6 @@ find_package(nanobind CONFIG REQUIRED)
 nanobind_add_module(sph_cuda sph_cuda.cu)
 
 set_property(TARGET sph_cuda PROPERTY CUDA_SEPARABLE_COMPILATION ON)
-set_property(TARGET sph_cuda PROPERTY CUDA_ARCHITECTURES "75;80;86")
 
 target_compile_options(sph_cuda PRIVATE 
     $<$<COMPILE_LANGUAGE:CUDA>:-g>
@@ -45,6 +46,4 @@ target_compile_options(sph_cuda PRIVATE
 )
 
 
-target_link_libraries(sph_cuda PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-
-
+target_include_directories(sph_cuda PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

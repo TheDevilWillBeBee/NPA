@@ -1,0 +1,26 @@
+# Paths are relative to asset_root, itself relative to this manifest.
+# These defaults use existing local caches; the benchmark never downloads assets.
+asset_root: ..
+
+emoji_targets:
+  - name: emoji_lizard
+    path: ../.emoji_cache/emoji_u1f98e.png
+  - name: emoji_fox
+    path: ../.emoji_cache/emoji_u1f98a.png
+  - name: emoji_octopus
+    path: ../.emoji_cache/emoji_u1f419.png
+  - name: emoji_butterfly
+    path: ../.emoji_cache/emoji_u1f98b.png
+
+texture_targets:
+  - name: texture_bubbly
+    path: data/transparent_textures/bubbly_0101.png
+  - name: texture_banded
+    archive: ../transparent_textures.zip
+    member: banded_0037.png
+  - name: texture_beeds
+    archive: ../transparent_textures.zip
+    member: beeds.png
+  - name: texture_bars
+    archive: ../transparent_textures.zip
+    member: bars.png

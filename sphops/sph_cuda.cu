@@ -4,6 +4,7 @@
 #include <cub/cub.cuh>
 #include <stdexcept>
 #include "utils.cuh"
+#include "perception.cuh"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -739,12 +740,14 @@ __global__ void backward_kernel(
     float * __restrict__ dL_rho_in,                         // Gradient of loss w.r.t. input density, Shape (batch_size, N)
     float * __restrict__ dL_state_in,                       // Gradient of loss w.r.t. input state, Shape (batch_size, N, feature_dim)
     uint32_t feature_dim,                     // Number of features in state
-    const uint32_t * __restrict__ total_blocks, // Total number of blocks in block_info
     const uint32_t * __restrict__ bin_offsets, // Shape (batch_size * cell_count + 1)
     const BlockInfo * __restrict__ block_info, // Block information array
     const GridConfig<DIM, BC, ST> config)
 {
-    if (blockIdx.x >= *total_blocks)
+    // BlockInfo belongs to the saved snapshot. The grid's block offsets are
+    // scratch storage and may already describe a later rollout step.
+    BlockInfo b_info = block_info[blockIdx.x];
+    if (b_info.particle_count == 0)
         return;
 
     __shared__ ParticlePosition<DIM> local_pos[STRIDE];
@@ -900,7 +903,6 @@ __global__ void backward_kernel(
         return; // Unsupported computation type
     }
 
-    BlockInfo b_info = block_info[blockIdx.x];
     int global_cell_idx = b_info.cell_idx;
     int local_cell_idx = global_cell_idx % config.cell_count; // Extract local cell index from global
 
@@ -1412,6 +1414,9 @@ __global__ void backward_kernel(
             for (uint32_t k = threadIdx.x; k < local_chunk * feature_dim; k += blockDim.x)
                 dL_ds_global[k] = dL_ds_buffer[k];
         }
+        // Vector position writes read components initialized by other threads.
+        // Finish those reads before a later local chunk clears the shared buffers.
+        __syncthreads();
     }
 }
 
@@ -1428,13 +1433,13 @@ __global__ void forward_kernel(
     float * __restrict__ grad_density_out,                  // Output density gradient tensor, Shape (batch_size, N, DIM)
     float * __restrict__ moment_matrix_out,                 // Output moment matrix tensor, Shape (batch_size, N, DIM, DIM)
     uint32_t feature_dim,                     // Number of features in state
-    const uint32_t * __restrict__ total_blocks, // Total number of blocks in block_info
     const uint32_t * __restrict__ bin_offsets, // Shape (batch_size * cell_count + 1)
     const BlockInfo * __restrict__ block_info, // Block information array
     const GridConfig<DIM, BC, ST> config)
 {
 
-    if (blockIdx.x >= *total_blocks)
+    BlockInfo b_info = block_info[blockIdx.x];
+    if (b_info.particle_count == 0)
         return;
 
     constexpr int NUM_ROWS = (DIM == 2) ? 3 : 9;
@@ -1497,7 +1502,6 @@ __global__ void forward_kernel(
         output_buffer = nullptr;
 
     // BlockInfo b_info = block_info[batch_idx * config.max_blocks_per_batch + blockIdx.x];
-    BlockInfo b_info = block_info[blockIdx.x];
     uint32_t batch_idx = b_info.batch_idx;
 
     if (b_info.particle_count == 0)
@@ -1878,7 +1882,8 @@ protected:
         }
 
         // Allocate cell counts array
-        cuda_check(cudaMalloc(&m_cell_counts, sizeof(uint32_t) * m_config.cell_count * batch_size));
+        // Exclusive scans include a zero sentinel to produce the final total.
+        cuda_check(cudaMalloc(&m_cell_counts, sizeof(uint32_t) * (m_config.cell_count * batch_size + 1)));
         cuda_check(cudaMalloc(&m_bin_write_indices, sizeof(uint32_t) * m_config.cell_count * batch_size));
 
         // Determine temporary storage requirements for CUB prefix sum
@@ -1891,7 +1896,7 @@ protected:
         if constexpr (ST == KernelStrategy::GridBased)
         {
             // Allocate blocks per cell array
-            cuda_check(cudaMalloc(&m_blocks_per_cell, sizeof(uint32_t) * m_config.cell_count * batch_size));
+            cuda_check(cudaMalloc(&m_blocks_per_cell, sizeof(uint32_t) * (m_config.cell_count * batch_size + 1)));
             cuda_check(cudaMalloc(&m_block_offsets, sizeof(uint32_t) * (m_config.cell_count * batch_size + 1)));
         }
 
@@ -1940,9 +1945,9 @@ public:
         // Cast device pointers
         const ParticlePosition<DIM> *d_positions = reinterpret_cast<const ParticlePosition<DIM> *>(positions.data());
 
-        cuda_check(cudaMemset(m_cell_counts, 0, sizeof(int32_t) * (m_config.cell_count * m_config.batch_size)));
+        cuda_check(cudaMemset(m_cell_counts, 0, sizeof(uint32_t) * (m_config.cell_count * m_config.batch_size + 1)));
         if constexpr (ST == KernelStrategy::GridBased)
-            cuda_check(cudaMemset(m_blocks_per_cell, 0, sizeof(uint32_t) * (m_config.cell_count * m_config.batch_size)));
+            cuda_check(cudaMemset(m_blocks_per_cell, 0, sizeof(uint32_t) * (m_config.cell_count * m_config.batch_size + 1)));
 
         // Launch kernel
         dim3 block_dim(256, 1, 1);
@@ -2055,6 +2060,139 @@ public:
             feature_dim, m_config);
     }
 
+    void perception_density_forward(
+        FloatArray3D positions, FloatArray2D mass, FloatArray2D volume, FloatArray3D density_gradient,
+        IntArray1D bin_offsets, BlockInfoArray block_info,
+        bool perceive_density_grad, uint64_t stream = 0)
+    {
+        if constexpr (ST != KernelStrategy::GridBased) {
+            throw std::runtime_error("Fused perception requires grid mode.");
+        } else {
+            validate_array_shape(positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "positions");
+            validate_array_shape(mass, {m_config.batch_size, m_config.particle_count}, "mass");
+            validate_array_shape(volume, {m_config.batch_size, m_config.particle_count}, "volume");
+            if (perceive_density_grad)
+                validate_array_shape(density_gradient, {m_config.batch_size, m_config.particle_count, DIM}, "density_gradient");
+            validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
+            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
+            auto position_ptr = reinterpret_cast<const ParticlePosition<DIM> *>(positions.data());
+            auto offset_ptr = reinterpret_cast<const uint32_t *>(bin_offsets.data());
+            auto info_ptr = reinterpret_cast<const BlockInfo *>(block_info.data());
+            auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+            if (perceive_density_grad)
+                fused_perception::density_forward<DIM, BC, true><<<m_max_blocks, fused_perception::DENSITY_THREADS, 0, cuda_stream>>>(
+                    position_ptr, mass.data(), volume.data(), density_gradient.data(), offset_ptr, info_ptr, m_config);
+            else
+                fused_perception::density_forward<DIM, BC, false><<<m_max_blocks, fused_perception::DENSITY_THREADS, 0, cuda_stream>>>(
+                    position_ptr, mass.data(), volume.data(), nullptr, offset_ptr, info_ptr, m_config);
+            cuda_check(cudaGetLastError());
+        }
+    }
+
+    void perception_forward(
+        FloatArray3D positions, FloatArray3D state, FloatArray2D volume,
+        FloatArray3D density_gradient, FloatArray1D eps0,
+        FloatArray3D perception, FloatArray4D gradient_values, FloatArray3D gradient_sum,
+        IntArray1D bin_offsets, BlockInfoArray block_info,
+        bool perceive_density_grad, bool normalize_state_grad,
+        bool normalize_density_grad, bool save_backward, uint64_t stream = 0)
+    {
+        if constexpr (ST != KernelStrategy::GridBased) {
+            throw std::runtime_error("Fused perception requires grid mode.");
+        } else {
+            uint32_t features = state.shape(2);
+            uint32_t output_dim = features * (2 + DIM) + (perceive_density_grad ? DIM : 0);
+            validate_array_shape(positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "positions");
+            validate_array_shape(state, {m_config.batch_size, m_config.particle_count, features}, "state");
+            validate_array_shape(volume, {m_config.batch_size, m_config.particle_count}, "volume");
+            validate_array_shape(eps0, {1}, "eps0");
+            validate_array_shape(perception, {m_config.batch_size, m_config.particle_count, output_dim}, "perception");
+            if (perceive_density_grad)
+                validate_array_shape(density_gradient, {m_config.batch_size, m_config.particle_count, DIM}, "density_gradient");
+            if (save_backward) {
+                validate_array_shape(gradient_sum, {m_config.batch_size, m_config.particle_count, DIM}, "gradient_sum");
+                if (normalize_state_grad)
+                    validate_array_shape(gradient_values, {m_config.batch_size, m_config.particle_count, features, DIM}, "gradient_values");
+            }
+            validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
+            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
+            auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+            auto launch = [&](auto feature_count) {
+                constexpr int FEATURES = decltype(feature_count)::value;
+                fused_perception::forward<DIM, FEATURES, BC><<<m_max_blocks, fused_perception::BLOCK_THREADS, 0, cuda_stream>>>(
+                    reinterpret_cast<const ParticlePosition<DIM> *>(positions.data()),
+                    state.data(), volume.data(), density_gradient.data(), eps0.data(),
+                    perception.data(), gradient_values.data(), gradient_sum.data(),
+                    reinterpret_cast<const uint32_t *>(bin_offsets.data()),
+                    reinterpret_cast<const BlockInfo *>(block_info.data()), m_config,
+                    perceive_density_grad, normalize_state_grad, normalize_density_grad, save_backward);
+            };
+            if (features == 4)
+                launch(std::integral_constant<int, 4>{});
+            else if (features == 8)
+                launch(std::integral_constant<int, 8>{});
+            else if (features == 16)
+                launch(std::integral_constant<int, 16>{});
+            else if (features == 32)
+                launch(std::integral_constant<int, 32>{});
+            else
+                throw std::runtime_error("Fused perception supports exactly 4, 8, 16, or 32 state channels.");
+            cuda_check(cudaGetLastError());
+        }
+    }
+
+    void perception_backward(
+        FloatArray3D positions, FloatArray2D volume, FloatArray3D grad_perception,
+        FloatArray4D gradient_values, FloatArray3D gradient_sum, FloatArray1D eps0,
+        FloatArray4D incoming, FloatArray3D grad_state,
+        IntArray1D bin_offsets, BlockInfoArray block_info,
+        bool perceive_density_grad, bool normalize_state_grad, uint64_t stream = 0)
+    {
+        if constexpr (ST != KernelStrategy::GridBased) {
+            throw std::runtime_error("Fused perception requires grid mode.");
+        } else {
+            uint32_t features = grad_state.shape(2);
+            uint32_t output_dim = features * (2 + DIM) + (perceive_density_grad ? DIM : 0);
+            validate_array_shape(positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "positions");
+            validate_array_shape(volume, {m_config.batch_size, m_config.particle_count}, "volume");
+            validate_array_shape(grad_perception, {m_config.batch_size, m_config.particle_count, output_dim}, "grad_perception");
+            if (normalize_state_grad)
+                validate_array_shape(gradient_values, {m_config.batch_size, m_config.particle_count, features, DIM}, "gradient_values");
+            validate_array_shape(gradient_sum, {m_config.batch_size, m_config.particle_count, DIM}, "gradient_sum");
+            validate_array_shape(eps0, {1}, "eps0");
+            validate_array_shape(incoming, {m_config.batch_size, m_config.particle_count, DIM + 1, features}, "incoming");
+            validate_array_shape(grad_state, {m_config.batch_size, m_config.particle_count, features}, "grad_state");
+            validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
+            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
+            auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+            auto launch = [&](auto feature_count) {
+                constexpr int FEATURES = decltype(feature_count)::value;
+                unsigned int particles = m_config.batch_size * m_config.particle_count;
+                constexpr int PREPARE_THREADS = fused_perception::BACKWARD_PREPARE_THREADS;
+                unsigned int blocks = (particles * FEATURES + PREPARE_THREADS - 1) / PREPARE_THREADS;
+                fused_perception::backward_prepare<DIM, FEATURES><<<blocks, PREPARE_THREADS, 0, cuda_stream>>>(
+                    grad_perception.data(), gradient_values.data(), gradient_sum.data(), eps0.data(),
+                    incoming.data(), grad_state.data(), particles, output_dim, m_config.eps, normalize_state_grad);
+                cuda_check(cudaGetLastError());
+                fused_perception::backward<DIM, FEATURES, BC><<<m_max_blocks, fused_perception::BLOCK_THREADS, 0, cuda_stream>>>(
+                    reinterpret_cast<const ParticlePosition<DIM> *>(positions.data()), volume.data(),
+                    incoming.data(), grad_state.data(), reinterpret_cast<const uint32_t *>(bin_offsets.data()),
+                    reinterpret_cast<const BlockInfo *>(block_info.data()), m_config);
+            };
+            if (features == 4)
+                launch(std::integral_constant<int, 4>{});
+            else if (features == 8)
+                launch(std::integral_constant<int, 8>{});
+            else if (features == 16)
+                launch(std::integral_constant<int, 16>{});
+            else if (features == 32)
+                launch(std::integral_constant<int, 32>{});
+            else
+                throw std::runtime_error("Fused perception supports exactly 4, 8, 16, or 32 state channels.");
+            cuda_check(cudaGetLastError());
+        }
+    }
+
     void density_forward(
         FloatArray3D binned_positions, // Shape (batch_size, N, DIM)
         FloatArray2D mass,             // Input mass, Shape (batch_size, N)
@@ -2079,7 +2217,6 @@ public:
         {
             const BlockInfo *d_block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
             dim3 block_dim(128, 1, 1);
-            uint32_t *total_blocks = &m_block_offsets[m_config.batch_size * m_config.cell_count];
             dim3 grid_dim(m_max_blocks, 1, 1);
 
             // determine shared memory size
@@ -2098,7 +2235,6 @@ public:
                 nullptr,            // No grad density output
                 nullptr,            // No moment matrix output
                 0,                  // No feature dim
-                total_blocks,       // Total blocks used
                 d_bin_offsets,      // Bin offsets
                 d_block_info,       // Block info
                 m_config);
@@ -2144,7 +2280,6 @@ public:
         if constexpr (ST == KernelStrategy::GridBased)
         {
             const BlockInfo *d_block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
-            uint32_t *total_blocks = &m_block_offsets[m_config.batch_size * m_config.cell_count];
             dim3 block_dim(128, 1, 1);
             dim3 grid_dim(m_max_blocks, 1, 1);
 
@@ -2162,7 +2297,6 @@ public:
                 nullptr,            // No grad density output
                 nullptr,            // No moment matrix output
                 0,                  // No feature dim
-                total_blocks,       // Total blocks used
                 d_bin_offsets,      // Bin offsets
                 d_block_info,       // Block info
                 m_config);
@@ -2217,7 +2351,6 @@ public:
         {
             // Cast block info
             const BlockInfo *d_block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
-            uint32_t *total_blocks = &m_block_offsets[m_config.batch_size * m_config.cell_count];
             dim3 block_dim(256, 1, 1);
             dim3 grid_dim(m_max_blocks, 1, 1);
             const int STRIDE = 64;
@@ -2234,7 +2367,6 @@ public:
                 nullptr,            // No grad density output
                 nullptr,            // No moment matrix output
                 feature_dim,        // Feature dimension
-                total_blocks,       // Total blocks used
                 d_bin_offsets,      // Bin offsets
                 d_block_info,       // Block info
                 m_config);
@@ -2304,7 +2436,6 @@ public:
         if constexpr (ST == KernelStrategy::GridBased)
         {
             const BlockInfo *d_block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
-            uint32_t *total_blocks = &m_block_offsets[m_config.batch_size * m_config.cell_count];
             dim3 block_dim(256, 1, 1);
             dim3 grid_dim(m_max_blocks, 1, 1);
             const int STRIDE = 64;
@@ -2322,7 +2453,6 @@ public:
                 nullptr,                   // No grad density output
                 nullptr,                   // No moment matrix output
                 feature_dim,               // Feature dimension
-                total_blocks,              // Total blocks used
                 d_bin_offsets,             // Bin offsets
                 d_block_info,              // Block info
                 m_config);
@@ -2387,7 +2517,6 @@ public:
         if constexpr (ST == KernelStrategy::GridBased)
         {
             const BlockInfo *d_block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
-            uint32_t *total_blocks = &m_block_offsets[m_config.batch_size * m_config.cell_count];
             dim3 block_dim(128, 1, 1);
             dim3 grid_dim(m_max_blocks, 1, 1);
             const int STRIDE = 128;
@@ -2404,7 +2533,6 @@ public:
                 density_gradient_out.data(), // Output density gradient
                 nullptr,                     // No moment matrix output
                 0,                           // No feature dim
-                total_blocks,                // Total blocks used
                 d_bin_offsets,               // Bin offsets
                 d_block_info,                // Block info
                 m_config);
@@ -2455,7 +2583,6 @@ public:
         if constexpr (ST == KernelStrategy::GridBased)
         {
             const BlockInfo *d_block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
-            uint32_t *total_blocks = &m_block_offsets[m_config.batch_size * m_config.cell_count];
             dim3 block_dim(128, 1, 1);
             dim3 grid_dim(m_max_blocks, 1, 1);
             const int STRIDE = 128;
@@ -2472,7 +2599,6 @@ public:
                 nullptr,                  // No grad density output
                 moment_matrix_out.data(), // Output moment matrix
                 0,                        // No feature dim
-                total_blocks,             // Total blocks used
                 d_bin_offsets,            // Bin offsets
                 d_block_info,             // Block info
                 m_config);
@@ -2528,7 +2654,6 @@ public:
         if constexpr (ST == KernelStrategy::GridBased)
         {
             BlockInfo *d_block_info = reinterpret_cast<BlockInfo *>(block_info.data());
-            uint32_t *total_blocks = &m_block_offsets[m_config.batch_size * m_config.cell_count];
             dim3 block_dim(128, 1, 1);
             dim3 grid_dim(m_max_blocks, 1, 1);
             const int STRIDE = 128;
@@ -2548,7 +2673,6 @@ public:
                 nullptr,            // No backward w.r.t. rho
                 nullptr,            // No backward w.r.t. state
                 0,                  // No feature dim
-                total_blocks,       // Total blocks used
                 d_bin_offsets,      // Bin offsets
                 d_block_info,       // Block info
                 m_config);
@@ -2626,7 +2750,6 @@ public:
         if constexpr (ST == KernelStrategy::GridBased)
         {
             BlockInfo *d_block_info = reinterpret_cast<BlockInfo *>(block_info.data());
-            uint32_t *total_blocks = &m_block_offsets[m_config.batch_size * m_config.cell_count];
             dim3 block_dim(256, 1, 1);
             dim3 grid_dim(m_max_blocks, 1, 1);
             const int STRIDE = 64;
@@ -2655,7 +2778,6 @@ public:
                     d_grad_rho,               // Gradient w.r.t. rho
                     d_grad_s,                 // Gradient w.r.t. state
                     feature_dim,              // Feature dim
-                    total_blocks,             // Total blocks used
                     d_bin_offsets,            // Bin offsets
                     d_block_info,             // Block info
                     m_config);
@@ -2758,7 +2880,6 @@ public:
         if constexpr (ST == KernelStrategy::GridBased)
         {
             BlockInfo *d_block_info = reinterpret_cast<BlockInfo *>(block_info.data());
-            uint32_t *total_blocks = &m_block_offsets[m_config.batch_size * m_config.cell_count];
             dim3 block_dim(128, 1, 1);
             dim3 grid_dim(m_max_blocks, 1, 1);
             const int STRIDE = 128;
@@ -2778,7 +2899,6 @@ public:
                 nullptr,                        // No backward w.r.t. rho
                 nullptr,                        // No backward w.r.t. state
                 0,                              // No feature dim
-                total_blocks,                   // Total blocks used
                 d_bin_offsets,                  // Bin offsets
                 d_block_info,                   // Block info
                 m_config);
@@ -2856,7 +2976,6 @@ public:
         if constexpr (ST == KernelStrategy::GridBased)
         {
             BlockInfo *d_block_info = reinterpret_cast<BlockInfo *>(block_info.data());
-            uint32_t *total_blocks = &m_block_offsets[m_config.batch_size * m_config.cell_count];
             dim3 block_dim(256, 1, 1);
             dim3 grid_dim(m_max_blocks, 1, 1);
             const int STRIDE = 32;
@@ -2885,7 +3004,6 @@ public:
                     d_grad_rho,               // Gradient w.r.t. rho
                     d_grad_s,                 // Gradient w.r.t. state
                     feature_dim,              // Feature dim
-                    total_blocks,             // Total blocks used
                     d_bin_offsets,            // Bin offsets
                     d_block_info,             // Block info
                     m_config);
@@ -2996,7 +3114,6 @@ public:
         if constexpr (ST == KernelStrategy::GridBased)
         {
             BlockInfo *d_block_info = reinterpret_cast<BlockInfo *>(block_info.data());
-            uint32_t *total_blocks = &m_block_offsets[m_config.batch_size * m_config.cell_count];
             dim3 block_dim(128, 1, 1);
             dim3 grid_dim(m_max_blocks, 1, 1);
             const int STRIDE = 128;
@@ -3016,7 +3133,6 @@ public:
                 d_grad_rho,                  // Gradient w.r.t. rho
                 nullptr,                     // No backward w.r.t. state
                 0,                           // No feature dim
-                total_blocks,                // Total blocks used
                 d_bin_offsets,               // Bin offsets
                 d_block_info,                // Block info
                 m_config);
@@ -3228,6 +3344,18 @@ void safe_inv_sym_mat(
 // Macro to add common properties and methods
 #define ADD_COMMON_GRID_BINDINGS(grid_class, GridType, pos_shape)                                                                 \
     grid_class                                                                                                                    \
+        .def("perception_density_forward", &GridType::perception_density_forward,                                                \
+             "positions"_a, "mass"_a, "volume"_a, "density_gradient"_a, "bin_offsets"_a, "block_info"_a,                         \
+             "perceive_density_grad"_a, "stream"_a = 0)                                                                          \
+        .def("perception_forward", &GridType::perception_forward,                                                                \
+             "positions"_a, "state"_a, "volume"_a, "density_gradient"_a, "eps0"_a, "perception"_a,                              \
+             "gradient_values"_a, "gradient_sum"_a, "bin_offsets"_a, "block_info"_a,                                              \
+             "perceive_density_grad"_a, "normalize_state_grad"_a, "normalize_density_grad"_a,                                    \
+             "save_backward"_a, "stream"_a = 0)                                                                                  \
+        .def("perception_backward", &GridType::perception_backward,                                                              \
+             "positions"_a, "volume"_a, "grad_perception"_a, "gradient_values"_a, "gradient_sum"_a, "eps0"_a,                    \
+             "incoming"_a, "grad_state"_a, "bin_offsets"_a, "block_info"_a,                                                       \
+             "perceive_density_grad"_a, "normalize_state_grad"_a, "stream"_a = 0)                                                \
         .def_prop_ro("grid_size_x", &GridType::grid_size_x, "Grid size in x dimension")                                           \
         .def_prop_ro("grid_size_y", &GridType::grid_size_y, "Grid size in y dimension")                                           \
         .def_prop_ro("eps", &GridType::eps, "Grid cell spacing")                                                                  \

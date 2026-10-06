@@ -1,9 +1,30 @@
 import torch
+import importlib.util
+import os
+import sys
 
-try:
+_extension_path = os.environ.get("NPA_SPH_EXTENSION_PATH")
+if _extension_path:
+    # Allow an isolated candidate build to be validated without replacing the
+    # installed extension. Importing the module alone does not initialize CUDA.
+    sph_cuda = sys.modules.get("sphops.sph_cuda")
+    if sph_cuda is not None:
+        if os.path.realpath(sph_cuda.__file__) != os.path.realpath(_extension_path):
+            raise ImportError("Changing the SPH extension requires a fresh Python process")
+    else:
+        _spec = importlib.util.spec_from_file_location("sphops.sph_cuda", _extension_path)
+        if _spec is None or _spec.loader is None:
+            raise ImportError(f"Cannot load SPH extension from {_extension_path}")
+        sph_cuda = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(sph_cuda)
+        sys.modules["sphops.sph_cuda"] = sph_cuda
+elif __package__:
     from sphops import sph_cuda
-except:
-    import sph_cuda
+else:
+    sph_cuda = sys.modules.get("sphops.sph_cuda")
+    if sph_cuda is None:
+        import sph_cuda
+        sys.modules["sphops.sph_cuda"] = sph_cuda
 import math
 from dataclasses import dataclass
 
@@ -37,6 +58,7 @@ class HashGridSnapshot:
     permutation: torch.Tensor
     block_info: torch.Tensor
     dim: int
+    mode: str = "grid"
 
 
 class HashGrid:
@@ -102,6 +124,7 @@ class HashGrid:
             permutation=permutation,
             block_info=block_info,
             dim=self.dim,
+            mode=self.mode,
         )
     
     def wrap_positions(self, x):
@@ -143,6 +166,10 @@ class Permute(torch.autograd.Function):
         ctx.dLdx = x.requires_grad
         ctx.dLds = s.requires_grad
         ctx.dLdm = mass.requires_grad
+        if not ctx.dLdm:
+            # A multi-output Function otherwise marks mass as differentiable
+            # whenever state/position requires grad, even for fixed input mass.
+            ctx.mark_non_differentiable(mass_bin)
         return x_bin, s_bin, mass_bin
 
     @staticmethod
@@ -484,6 +511,154 @@ def gradient_hybrid(x_bin, rho, s_bin, snapshot, mass=None):
     return grad_s
 
     # return raw_grad_s @ L  # [B, N, C, dim]
+
+
+def _fused_perception_channel_count(channels):
+    """Smallest native subwarp specialization, or None for unsupported sizes."""
+    return next((count for count in (4, 8, 16, 32) if 0 < channels <= count), None)
+
+
+def fused_perception_supported(x_bin, s_bin, snapshot, mass=None):
+    """Fixed-mass, detached-position grid workloads, including padded channels."""
+    return (
+        x_bin.is_cuda
+        and s_bin.is_cuda
+        and x_bin.device == s_bin.device
+        and not x_bin.requires_grad
+        and snapshot.mode == "grid"
+        and _fused_perception_channel_count(s_bin.shape[-1]) is not None
+        and x_bin.dtype == s_bin.dtype == torch.float32
+        and x_bin.is_contiguous()
+        and s_bin.is_contiguous()
+        and (mass is None or (
+            mass.shape in (x_bin.shape[:2], (*x_bin.shape[:2], 1))
+            and mass.device == x_bin.device
+            and mass.dtype == torch.float32
+            and not mass.requires_grad
+        ))
+        and hasattr(snapshot.grid, "perception_forward")
+    )
+
+
+class FusedPerception(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x_bin, s_bin, mass, snapshot, eps0, density_grad,
+                log_norm_grad, log_norm_density_grad, save_backward):
+        B, N, C = s_bin.shape
+        dim = snapshot.dim
+        volume = s_bin.new_empty(B, N)
+        grad_density = s_bin.new_empty(B, N, dim) if density_grad else s_bin.new_empty(0, 0, 0)
+        gradient_values = (
+            s_bin.new_empty(B, N, C, dim)
+            if save_backward and log_norm_grad else s_bin.new_empty(0, 0, 0, 0)
+        )
+        gradient_sum = s_bin.new_empty(B, N, dim) if save_backward else s_bin.new_empty(0, 0, 0)
+        output = s_bin.new_empty(B, N, C * (2 + dim) + (dim if density_grad else 0))
+        stream = torch.cuda.current_stream(x_bin.device).cuda_stream
+        grid = snapshot.grid
+        grid.perception_density_forward(
+            x_bin, mass, volume, grad_density, snapshot.bin_offsets,
+            snapshot.block_info, density_grad, stream,
+        )
+        grid.perception_forward(
+            x_bin, s_bin, volume, grad_density, eps0, output,
+            gradient_values, gradient_sum, snapshot.bin_offsets,
+            snapshot.block_info, density_grad, log_norm_grad,
+            log_norm_density_grad, save_backward, stream,
+        )
+        if save_backward:
+            ctx.save_for_backward(x_bin, volume, gradient_values, gradient_sum, eps0)
+            ctx.snapshot = snapshot
+            ctx.state_shape = s_bin.shape
+            ctx.density_grad = density_grad
+            ctx.log_norm_grad = log_norm_grad
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_bin, volume, gradient_values, gradient_sum, eps0 = ctx.saved_tensors
+        snapshot = ctx.snapshot
+        B, N, C = ctx.state_shape
+        incoming = grad_output.new_empty(B, N, snapshot.dim + 1, C)
+        grad_s = grad_output.new_empty(B, N, C)
+        snapshot.grid.perception_backward(
+            x_bin, volume, grad_output.contiguous(), gradient_values,
+            gradient_sum, eps0, incoming, grad_s, snapshot.bin_offsets,
+            snapshot.block_info, ctx.density_grad, ctx.log_norm_grad,
+            torch.cuda.current_stream(x_bin.device).cuda_stream,
+        )
+        return None, grad_s, None, None, None, None, None, None, None
+
+
+def _log_normalize_gradient(value):
+    return torch.log(1.0 + value.norm(dim=-1, keepdim=True)) * torch.nn.functional.normalize(value, dim=-1)
+
+
+def perception(x_bin, s_bin, snapshot, eps0, *, mass=None, state_grad=True,
+               density_grad=True, log_norm_grad=True,
+               log_norm_density_grad=True, use_fused=True):
+    """Pack NPA perception, preserving the hybrid gradient's straight-through backward.
+
+    The fused specialization uses fixed masses and 1..32 channels in grid mode.
+    mass is in binned particle order, with shape [B,N] or [B,N,1]; omission
+    creates ones, using the same mass-aware kernel. No mass gradients are taken.
+    PyTorch zero-pads to native 4/8/16/32 channels and unpacks each feature field;
+    both operations preserve autograd. Native sizes need no padding or copies.
+    Unsupported shapes, position gradients, and disabled state perception use
+    the original differentiable operations. eps0 is a one-element CUDA tensor;
+    keeping it on device avoids a scalar synchronization on every rollout step.
+    """
+    mass = _default_mass(x_bin, mass)
+    if mass.shape != x_bin.shape[:2] or mass.device != x_bin.device or mass.dtype != x_bin.dtype:
+        raise ValueError("mass must have shape [B,N] or [B,N,1] and match the positions' device and dtype")
+    if mass.requires_grad:
+        raise ValueError("perception supports fixed masses only; mass must not require gradients")
+    mass = mass.contiguous()
+    if use_fused and state_grad and fused_perception_supported(x_bin, s_bin, snapshot, mass):
+        if eps0.shape != (1,) or eps0.device != x_bin.device or eps0.dtype != torch.float32:
+            raise ValueError("eps0 must be a one-element float32 tensor on the input CUDA device")
+        if eps0.requires_grad:
+            raise ValueError("The fused path does not differentiate the eps0 buffer")
+        channels = s_bin.shape[-1]
+        padded_channels = _fused_perception_channel_count(channels)
+        padded_state = (
+            torch.nn.functional.pad(s_bin, (0, padded_channels - channels))
+            if padded_channels != channels else s_bin
+        )
+        save_backward = torch.is_grad_enabled() and padded_state.requires_grad
+        output = FusedPerception.apply(
+            x_bin, padded_state, mass, snapshot, eps0, density_grad, log_norm_grad,
+            log_norm_density_grad, save_backward,
+        )
+        if padded_channels == channels:
+            return output
+        # Padding shifts every field after state. A final output truncation
+        # would mix channels from different fields and drop density gradients.
+        dim = snapshot.dim
+        parts = [
+            output[..., :channels],
+            output[..., padded_channels:padded_channels + channels],
+            output[..., 2 * padded_channels:2 * padded_channels + channels * dim],
+        ]
+        if density_grad:
+            parts.append(output[..., padded_channels * (2 + dim):])
+        return torch.cat(parts, dim=-1)
+
+    rho = density(x_bin, snapshot, mass=mass)
+    features = [s_bin, blur(x_bin, rho, s_bin, snapshot, mass=mass)]
+    scale = snapshot.grid.eps / eps0
+    if state_grad:
+        grad_s = gradient_hybrid(x_bin, rho, s_bin, snapshot, mass=mass) * scale
+        if log_norm_grad:
+            grad_s = _log_normalize_gradient(grad_s)
+        features.append(grad_s.flatten(-2))
+    if density_grad:
+        grad_rho = density_gradient(x_bin, snapshot, mass=mass)
+        grad_rho = grad_rho * scale ** (1 + snapshot.dim) / s_bin.shape[1]
+        if log_norm_density_grad:
+            grad_rho = _log_normalize_gradient(grad_rho)
+        features.append(grad_rho)
+    return torch.cat(features, dim=-1)
 
 
 if __name__ == "__main__":

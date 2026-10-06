@@ -31,6 +31,11 @@ The code has been tested across multiple CUDA and PyTorch versions. For best res
 python3 test.py
 ```
 
+NPA uses fused SPH perception by default for supported CUDA grid workloads, with
+automatic fallback to the original operations. Set `fused_perception=False` to
+opt out; see [fused perception](sphops/FUSED_PERCEPTION.md) for details and
+[benchmarking](sphops/BENCHMARKS.md) for validation and performance results.
+
 ## Training
 
 ```bash

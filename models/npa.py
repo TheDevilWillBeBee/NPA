@@ -1,14 +1,6 @@
 import torch
 import numpy as np
-from sphops import (
-    blur,
-    gradient,
-    moment_matrix,
-    density_gradient,
-    density,
-    gradient_hybrid,
-)
-from sphops import bin_particles, unbin_particles, HashGrid
+from sphops import perception, bin_particles, unbin_particles, HashGrid
 
 
 class NPA(torch.nn.Module):
@@ -27,6 +19,7 @@ class NPA(torch.nn.Module):
         output_dims=None, # Output dimensions for the read-out MLP. 
         stopgrad_pos=True, # Whether to Detach input position to the Perception
         stopgrad_state=False, # Whether to Detach input state to the Perception
+        fused_perception=True, # Fused CUDA perception when supported; otherwise use the original operations.
     ):
         super().__init__()
         self.spatial_dims = spatial_dims
@@ -40,6 +33,7 @@ class NPA(torch.nn.Module):
         self.log_norm_density_grad = log_norm_density_grad
         self.stopgrad_pos = stopgrad_pos
         self.stopgrad_state = stopgrad_state
+        self.fused_perception = fused_perception
 
         perception_dim = state_dims * 2
         if density_grad:
@@ -84,13 +78,17 @@ class NPA(torch.nn.Module):
         log_grad_norm = torch.log(1.0 + grad_x.norm(dim=-1, keepdim=True))
         return log_grad_norm * torch.nn.functional.normalize(grad_x, dim=-1)
 
-    def perceive(self, x, s, grid: HashGrid):
-        B, N, C = s.shape
-        eps = grid.eps
+    def perceive(self, x, s, grid: HashGrid, mass=None):
         with torch.no_grad():
             snapshot = grid.instantiate(x)
 
-        x_bin, s_bin = bin_particles(x, s, snapshot)
+        if mass is None:
+            x_bin, s_bin = bin_particles(x, s, snapshot)
+            mass_bin = None
+        else:
+            if mass.requires_grad:
+                raise ValueError("NPA perception supports fixed masses only")
+            x_bin, s_bin, mass_bin = bin_particles(x, s, snapshot, mass=mass.contiguous())
 
         if self.stopgrad_pos:
             x_perceive = x_bin.detach()
@@ -102,44 +100,20 @@ class NPA(torch.nn.Module):
         else:
             s_perceive = s_bin
 
-        rho = density(x_perceive, snapshot)  # (B, N, 1)
-
-        blur_s = blur(x_perceive, rho, s_perceive, snapshot)  # (B, N, C)
-        
-        z = [s_perceive, blur_s]
-        
-        if self.state_grad:
-        
-    #         grad_s = gradient(x_bin_detach, rho, s_bin, snapshot) # (B, N, C, dim)
-            grad_s = gradient_hybrid(x_perceive, rho, s_perceive, snapshot)
-
-            coef = eps / self.eps0
-
-            grad_s = grad_s * coef
-
-            if self.log_norm_grad:
-                grad_s = self._log_normalize_grad(grad_s)
-
-            z.append(grad_s.view(B, N, -1))
-
-        if self.density_grad:
-            grad_rho = density_gradient(x_perceive, snapshot)  # (B, N, dim)
-            grad_rho = grad_rho * (coef ** (1 + self.spatial_dims))
-            total_mass = N # Default mass of each particle is 1, so total mass is N. 
-            grad_rho = grad_rho / total_mass # This is needed to make the grad_rho scale invariant to the number of particles.
-            if self.log_norm_density_grad:
-                grad_rho = self._log_normalize_grad(grad_rho)
-
-            z.append(grad_rho)
-
-        z = torch.cat(z, dim=-1)  # (B, N, C * (2 + dim) + dim)
+        z = perception(
+            x_perceive, s_perceive, snapshot, self.eps0,
+            mass=mass_bin,
+            state_grad=self.state_grad, density_grad=self.density_grad,
+            log_norm_grad=self.log_norm_grad,
+            log_norm_density_grad=self.log_norm_density_grad,
+            use_fused=self.fused_perception,
+        )
 
         return z, x_bin, s_bin, snapshot
 
-    def forward(self, x, s, grid: HashGrid):
-        B, N, C = s.shape
+    def forward(self, x, s, grid: HashGrid, mass=None):
         eps = grid.eps
-        z, x_bin, s_bin, snapshot = self.perceive(x, s, grid)
+        z, x_bin, s_bin, snapshot = self.perceive(x, s, grid, mass=mass)
         self.last_snapshot = snapshot
 
         y = self.model(z)  # (B, N, dim + C)
