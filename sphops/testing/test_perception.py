@@ -105,7 +105,7 @@ class CPUPerceptionTests(unittest.TestCase):
                         parts.append(torch.arange(dim, dtype=padded.dtype).expand(B, N, dim) + 10)
                     captured["output"] = torch.cat(parts, -1)
                     captured["output"].retain_grad()
-                    snapshot = torch.zeros(2 * 4 + B * 4 + 1 + B * N, dtype=torch.int32)
+                    snapshot = torch.zeros(2 * sph.BLOCK_INFO_WORDS + B * 4 + 1 + B * N, dtype=torch.int32)
                     return captured["output"], x * 1, padded * 1, snapshot
                 with patch.object(sph.FusedPerception, "apply", side_effect=fake_native):
                     output, _, s_bin, snapshot = sph.fused_perception(

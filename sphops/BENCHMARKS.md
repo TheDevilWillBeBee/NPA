@@ -690,3 +690,176 @@ Scripts and raw results of this round (A/B timing, numerical comparison,
 trained-state validation, Nsight exports of the intermediate variants) are
 local in `results/kernel_opt_20261008/` and in the session scratch directory;
 they are not source-controlled.
+
+## Third optimization round (2026-10-08): several lanes per particle in sparse blocks
+
+The second-round profiles left one structural inefficiency: with one lane per
+particle, a grid block with few particles (shape boundaries, the 3D ball's
+cells of about 10 particles, the ragged last pass of a dense block) runs its
+warps with most lanes idle, and the active lanes per instruction were 16-18 of
+32 in the sparse cases. The pass loop of the three neighbor kernels now gives
+each particle 2, 4 or 8 lanes when at most 16, 8 or 4 particles are left in
+the block (`lane_share_shift`, uniform over the block), capped by the block's
+candidate density (`lane_share_cap`: 2, 4 or 8 lanes need at least 4, 8 or 16
+candidates per neighbor row span). The lanes of one particle take interleaved
+candidates of every tile (lane r takes candidates r, r + share, ...), reduce
+their partial sums with an xor-shuffle butterfly before the team reduction,
+and the first lane of each particle owns the outputs (`slot` instead of `lane`
+indexes the staged rows). Passes with one lane per particle keep the previous
+stride-1 candidate loop; the strided loop is a second branch of
+`for_each_neighbor`. Dense blocks are unchanged.
+
+The candidate density comes from the block record: `assign_block_info` sums
+the lengths of the cell's neighbor row spans once per cell (3 spans in 2D, 9
+in 3D, plus the periodic wrap chunks) and stores the average per row in a new
+`BlockInfo::candidates_per_row` field. `BlockInfo` is therefore 32 bytes;
+the extension exports `BLOCK_INFO_WORDS = 8` and `sph.py` sizes the record
+tensor and the saved snapshot from it (older extension builds without the
+constant still load with 4 words). The record kernel grew from 1.6 to 3.2 µs
+in 2D and from 2.6 to 9.8 µs in 3D per grid build.
+
+Nsight Compute kernel durations at locked base clocks, medians of three
+(before) and four (after) profiled calls per build (C=16; 2D cases B=8,
+N=4096, cap 32; 3D is the `growing-3dgs.yaml` ball seed, B=4, N=16384, cap
+64), second round → this round, with the executed warp instructions and the
+average active lanes per instruction of the forward kernel:
+
+| Case | `forward` | `backward` | `density_forward` | Forward instructions | Active lanes (fwd / bwd) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| growing_seed (dense disk, clamped) | 350.0 → 332.2 µs | 350.8 → 351.5 µs | 102.7 → 103.8 µs | 214.6 → 207.9 M (−3%) | 18.5 → 19.1 / 20.4 → 21.0 |
+| texture_seed (uniform, periodic) | 107.0 → 104.0 µs | 105.0 → 90.3 µs | 34.3 → 29.9 µs | 64.3 → 53.7 M (−16%) | 15.7 → 19.1 / 17.7 → 21.1 |
+| emoji_lizard (shape, clamped) | 93.0 → 79.2 µs | 72.4 → 71.3 µs | 22.2 → 19.5 µs | 43.7 → 35.6 M (−18%) | 15.6 → 20.0 / 17.2 → 21.6 |
+| ball_3d (clamped) | 396.2 → 359.9 µs | 258.6 → 214.2 µs | 113.0 → 106.6 µs | 209.6 → 185.9 M (−11%) | 16.2 → 22.2 / 17.1 → 23.5 |
+
+Backward and density instructions fell by the same 12-18% in the sparse cases
+(3D backward 167.2 → 137.4 M). The durations fall less than the instructions
+because the sparse kernels are latency bound (issue slot utilization 45-55%
+in the forward): the per-pass costs (tile loads, barriers, team reduction,
+epilogue) are untouched, and the periodic uniform forward is dominated by
+them. The emoji backward varies by ±5% between profiled calls (binning
+order), so its −1.5% is within noise; its instruction count fell 17%.
+
+The same kernels over particle counts (locked base clocks, medians of three
+calls, same grids as the corpus so the particles per cell grow with N; 2D
+B=8, 3D B=4):
+
+| Case | N | `forward` | `backward` | `density_forward` |
+| --- | ---: | ---: | ---: | ---: |
+| growing_seed (dense disk) | 2,048 | 130.5 → 128.0 µs (−2%) | 131.6 → 130.8 µs (−1%) | 36.8 → 36.3 µs (−1%) |
+| growing_seed (dense disk) | 4,096 | 353.6 → 334.7 µs (−5%) | 363.8 → 351.4 µs (−3%) | 104.2 → 102.0 µs (−2%) |
+| growing_seed (dense disk) | 8,192 | 1,156 → 1,099 µs (−5%) | 1,112 → 1,110 µs (0%) | 300.6 → 302.0 µs (0%) |
+| growing_seed (dense disk) | 16,384 | 4,248 → 4,021 µs (−5%) | 3,880 → 3,975 µs (+2%) | 970.9 → 974.6 µs (0%) |
+| growing_seed (dense disk) | 32,768 | 16,242 → 15,451 µs (−5%) | 14,722 → 15,049 µs (+2%) | 3,571 → 3,527 µs (−1%) |
+| texture_seed (uniform, periodic) | 2,048 | 46.8 → 44.2 µs (−6%) | 34.0 → 33.6 µs (−1%) | 15.4 → 14.6 µs (−6%) |
+| texture_seed (uniform, periodic) | 4,096 | 111.9 → 106.2 µs (−5%) | 106.5 → 94.0 µs (−12%) | 31.6 → 29.6 µs (−6%) |
+| texture_seed (uniform, periodic) | 8,192 | 299.7 → 291.9 µs (−3%) | 255.6 → 241.6 µs (−5%) | 86.9 → 85.9 µs (−1%) |
+| texture_seed (uniform, periodic) | 16,384 | 988.9 → 967.8 µs (−2%) | 831.9 → 777.0 µs (−7%) | 261.5 → 258.7 µs (−1%) |
+| texture_seed (uniform, periodic) | 32,768 | 3,599 → 3,607 µs (0%) | 3,051 → 2,879 µs (−6%) | 920.9 → 919.2 µs (0%) |
+| emoji_lizard (shape) | 2,048 | 43.5 → 36.5 µs (−16%) | 29.3 → 25.0 µs (−15%) | 10.8 → 10.2 µs (−6%) |
+| emoji_lizard (shape) | 4,096 | 89.3 → 77.4 µs (−13%) | 69.0 → 67.1 µs (−3%) | 21.5 → 19.6 µs (−9%) |
+| emoji_lizard (shape) | 8,192 | 206.2 → 189.2 µs (−8%) | 175.0 → 167.5 µs (−4%) | 52.1 → 50.5 µs (−3%) |
+| emoji_lizard (shape) | 16,384 | 643.8 → 577.0 µs (−10%) | 555.8 → 537.4 µs (−3%) | 151.3 → 145.0 µs (−4%) |
+| emoji_lizard (shape) | 32,768 | 2,243 → 2,092 µs (−7%) | 1,929 → 1,924 µs (0%) | 490.3 → 481.0 µs (−2%) |
+| texture_bubbly (periodic) | 2,048 | 48.6 → 45.5 µs (−7%) | 46.0 → 33.8 µs (−27%) | 16.5 → 15.1 µs (−9%) |
+| texture_bubbly (periodic) | 4,096 | 112.1 → 104.7 µs (−7%) | 103.8 → 89.9 µs (−13%) | 32.1 → 30.0 µs (−7%) |
+| texture_bubbly (periodic) | 8,192 | 293.4 → 279.1 µs (−5%) | 258.8 → 231.7 µs (−10%) | 86.2 → 86.0 µs (0%) |
+| texture_bubbly (periodic) | 16,384 | 937.1 → 912.1 µs (−3%) | 808.4 → 740.5 µs (−8%) | 259.3 → 253.6 µs (−2%) |
+| texture_bubbly (periodic) | 32,768 | 3,363 → 3,314 µs (−1%) | 2,853 → 2,660 µs (−7%) | 884.0 → 884.0 µs (0%) |
+| ball_3d | 4,096 | 166.6 → 175.7 µs (+5%) | 96.9 → 99.2 µs (+2%) | 57.0 → 60.0 µs (+5%) |
+| ball_3d | 8,192 | 256.1 → 261.9 µs (+2%) | 155.4 → 148.3 µs (−5%) | 82.2 → 87.3 µs (+6%) |
+| ball_3d | 16,384 | 385.6 → 349.9 µs (−9%) | 257.8 → 212.3 µs (−18%) | 110.7 → 107.6 µs (−3%) |
+| ball_3d | 32,768 | 606.1 → 481.5 µs (−21%) | 459.0 → 347.7 µs (−24%) | 153.6 → 136.8 µs (−11%) |
+| ball_3d | 65,536 | 1,090 → 975.3 µs (−10%) | 851.3 → 724.6 µs (−15%) | 250.6 → 243.8 µs (−3%) |
+
+The gains hold at every count and shrink as the cells fill up (at N=32,768
+on the 16 × 16 grids most blocks hold 32 particles, which share nothing). In
+3D the ball keeps its radius, so N sets the particles per cell: about 1 at
+4,096, 13 at 16,384 (the configured case), 50 at 65,536. At 1 particle per
+cell a tile holds about 3 candidates, which is where the cap matters: without
+it (lanes shared by the particle count alone) the 3D forward was +21% at
+N=4,096 and +13% at 8,192 (the butterfly of 73 partials per step with nothing
+to split), with it +5% and +2%; above that the capped and the uncapped
+versions are the same. The remaining few percent at the smallest counts are
+the fixed cost of the sharing machinery (record load, lane arithmetic, the
+loop branch) in blocks with little work.
+
+Kernel time per `fused_perception` call (CUPTI sum of all kernels of the
+call, including grid build, binning and unbinning; normal clocks; two interleaved fresh-process rounds per build, C=16; the ranges are the two rounds):
+
+| Case | Forward | Backward |
+| --- | ---: | ---: |
+| growing_seed | 397-428 → 380 µs | 308-410 → 309-313 µs |
+| texture_seed | 132 → 125-126 µs | 94 → 80-82 µs |
+| emoji_lizard | 105 → 92-94 µs | 67 → 61-62 µs |
+| emoji_fox | 85-86 → 79-81 µs | 52-53 → 49-50 µs |
+| texture_bubbly | 130-147 → 124-126 µs | 92-93 → 80-83 µs |
+| texture_banded | 119-151 → 117-120 µs | 84-85 → 74-76 µs |
+| ball_3d | 447-504 → 408-416 µs | 242-325 → 198-202 µs |
+
+Correctness:
+
+- `test_perception` (14 CPU + 29 CUDA), `test_pipeline` (14) and the
+  standalone `testing/test.py` suite pass; Compute Sanitizer memcheck,
+  synccheck and initcheck 0 errors, racecheck (fused, grid and binning
+  kernels) 0 hazards. The shuffle reduction is deterministic (same tree in
+  every lane), so results stay bitwise reproducible for a given binning.
+- Against the pre-round-2 build on the corpus plus the 3D and
+  one-particle-per-cell cases (C = 5/16/32, unit and explicit masses):
+  relative L2 at most 3.3e-6, unchanged from the second round (the
+  differences are the second round's periodic wrap).
+- Trained lizard rollout states (B=2, 40 steps) against the float64 dense
+  reference: 1.3e-7 (gradient features), 4.1e-7 (density gradient) and 3.4e-7 (adjoint) relative L2, the same as before.
+- `test_tiny_state_gradients_preserve_normalization_backward_accuracy` fails
+  in some runs (3 of 5 full-suite runs with an intermediate build, 0 to 8 of
+  40 isolated repetitions with the final one; one element of 3072 at state
+  scale 1e-4, channels 16, always sample 1, particle 49, channel 4) and
+  passes in others; the previous build showed the same in full-suite runs.
+  Which runs fail depends on the atomic binning order. Against a float64
+  dense reference (`tiny_diag.py`) the element is 0.81844; the fused adjoint
+  gives 0.81764 (8.0e-4 off) and the test's float32 legacy reference 0.81694
+  (1.5e-3 off), so the tolerance breach is the reference's float32
+  cancellation in the normalization Jacobian at tiny gradient norms, and the
+  fused kernel is the closer of the two. Normwise, both builds and the
+  reference sit at the same 3.4-3.9e-4 relative distance from float64 at
+  this scale (2.7e-7 at scale 1), with zero breaches at scales 1e-5 and 1.
+
+Matched 300-update graft training (`benchmark_training`), second round → this
+round: emoji fox 20.13 / 19.87 → 19.87 s (rollout forward 9.01 / 8.93 → 8.91 s, backward 8.61 / 8.44 → 8.51 s), texture bubbly 14.33 → 14.26 s; peak memory (5.07 / 2.41 GiB) and last-25 losses (fox 1.186 / 1.188 → 1.255, bubbly 2.350 → 2.352, within run-to-run variation) unchanged. As in the second round, the step is host-launch bound,
+so kernel gains of 5-20% do not reach the training time.
+
+Variants measured and not kept (same locked-clock method):
+
+- Strided candidate loop in every pass (`j = sub; j < count; j += share`,
+  also with an explicit trip count): −8 to −11% on the sparse 2D forward and
+  backward, but the variable stride costs 2-3 integer instructions per
+  candidate, which the dense density kernel (about 20 instructions per
+  candidate) paid as +15%, and the dense backward +4%. The two-branch loop
+  keeps the dense cases at the previous instruction counts.
+- Contiguous candidate ranges per lane (lane r takes candidates
+  [r·chunk, (r+1)·chunk)): stride-1 loop everywhere, but the lanes of one
+  particle then read tile rows a multiple of 32 banks apart: 3x the shared
+  bank conflicts (texture_seed backward 1.6 M versus 0.5 M), backward +8%
+  sparse 2D.
+- Padding the staged payload rows to an odd number of `float4` (forward
+  states 16 → 20 floats, backward cotangents 48 → 52 in 2D, 64 → 68 in 3D):
+  removes the remaining conflicts (3D backward 7.6 M → 31 k, shared
+  wavefronts −50%) but no kernel is faster, and the larger tiles cost
+  occupancy (2D backward 49% → 43%, emoji backward +4%). The conflicts are
+  not on the critical path.
+- Lanes shared by the particle count alone (no density cap): the particle
+  sweep above, 3D forward +21% at N=4,096.
+- Candidate density summed inside the neighbor kernels (every warp walks the
+  9 spans of its block before the pass loop): the same 3D small-count cases
+  +23% forward and +29% density, as expensive as the regression it removes.
+- The cell's own particle count as the density proxy (free): fixes 3D, but
+  the boundary cells of the dense disk have few particles and full
+  neighbor rows, so it caps them wrongly: dense forward −1 to −3% instead of
+  −5%. The record field costs nothing in the neighbor kernels.
+
+The full Nsight Compute reports in `sphops/ncu_reports/fused_round2_20261008/`
+were regenerated from these kernels (installed extension rebuilt for sm_75,
+sm_80, sm_86 and sm_89; 124 s, 9.8 MB). Scripts and raw results (variant
+builds A/B, bank-conflict counts, the particle sweep `scale_sweep_ncu.py` +
+`parse_sweep.py` with its CSV exports under `sweep/`, the repeated tiny-state
+check `tiny_diag.py`) are in `results/kernel_opt_20261008/`, not
+source-controlled.

@@ -99,6 +99,37 @@ struct TeamLayout {
                   "Static shared memory exceeds 48 KiB: reduce NEIGHBOR_WARPS or TILE_BYTES_PER_WARP");
 };
 
+// log2 of the lanes per particle in one pass over a grid block: a sparse block
+// (few particles left) gives each particle several lanes, which split its
+// candidates (lane r of the particle takes candidates j = r, r + share, ...).
+// Block-uniform.
+__device__ __forceinline__ unsigned int lane_share_shift(unsigned int remaining)
+{
+    return remaining <= 4 ? 3u : remaining <= 8 ? 2u : remaining <= 16 ? 1u : 0u;
+}
+
+// Largest useful lanes-per-particle shift for a block's candidate density
+// (average candidates per neighbor row span, from the block record): the
+// butterfly costs PARTIALS shuffles per step, so sharing pays only when the
+// lanes of a particle have enough candidates per tile to split.
+__device__ __forceinline__ unsigned int lane_share_cap(unsigned int per_row)
+{
+    return per_row >= 16 ? 3u : per_row >= 8 ? 2u : per_row >= 4 ? 1u : 0u;
+}
+
+// Sum the partials of the `share` lanes of each particle with an xor butterfly,
+// so every lane of the group ends with the same total (a + b = b + a exactly,
+// and the tree is the same in all lanes). `share` is warp-uniform; all lanes call this.
+template <int N>
+__device__ __forceinline__ void reduce_lanes(float *values, unsigned int share)
+{
+    for (unsigned int step = 1; step < share; step <<= 1) {
+        #pragma unroll
+        for (int e = 0; e < N; ++e)
+            values[e] += __shfl_xor_sync(0xffffffffu, values[e], step);
+    }
+}
+
 // Sum per-lane partials of teams 1..NEIGHBOR_WARPS-1 into team 0, in that
 // fixed order. All block threads must call this (it contains barriers).
 template <int PARTIALS, typename Layout>
@@ -281,11 +312,13 @@ struct TileCursor {
 // for each candidate j of the tile inside the kernel support, where r is the
 // displacement to j and d2 = |r|^2, and tile + POSITION_OFFSET holds the tile's
 // positions. All lanes of the warp must call this (the barriers are per warp).
+// `sub` and `shift`: this lane handles candidates j = sub, sub + 2^shift, ...
+// of every tile (2^shift lanes per particle, see lane_share_shift).
 template <int TILE, int TILE_FLOATS, int BUFFERS, int POSITION_OFFSET, int DIM, BoundaryCondition BC,
           typename Load, typename Pair>
 __device__ __forceinline__ void for_each_neighbor(
     const GridConfig<DIM, BC> &config, const int *cell, unsigned int batch, const uint32_t *bin_offsets,
-    unsigned int team, bool valid, const ParticlePosition<DIM> &position,
+    unsigned int team, bool valid, unsigned int sub, unsigned int shift, const ParticlePosition<DIM> &position,
     float *tiles, float h2, Load load, Pair pair)
 {
     TileCursor<TILE, DIM, BC> cursor(config, cell, batch, bin_offsets, team);
@@ -310,12 +343,22 @@ __device__ __forceinline__ void for_each_neighbor(
         __syncwarp();  // Every lane's copies of the current tile are visible.
         if (valid) {
             const auto *tile_pos = reinterpret_cast<const ParticlePosition<DIM> *>(tile + POSITION_OFFSET);
-            for (unsigned int j = 0; j < count; ++j) {
+            auto candidate = [&](unsigned int j) {
                 ParticlePosition<DIM> r = config.displacement(position, tile_pos[j]);
                 float d2 = dot(r, r);
-                if (d2 >= h2)
-                    continue;
-                pair(j, r, d2, tile);
+                if (d2 < h2)
+                    pair(j, r, d2, tile);
+            };
+            // One lane per particle keeps the plain stride-1 loop (its
+            // addresses fold into immediates); shared particles interleave
+            // their lanes over the tile, which keeps the lanes' shared-memory
+            // reads in distinct banks.
+            if (shift == 0) {
+                for (unsigned int j = 0; j < count; ++j)
+                    candidate(j);
+            } else {
+                for (unsigned int j = sub; j < count; j += 1u << shift)
+                    candidate(j);
             }
         }
         __syncwarp();  // Finish reading this buffer before it is refilled.
@@ -476,6 +519,7 @@ __global__ void __launch_bounds__(DensityLayout<DIM, DENSITY_GRAD>::THREADS,
 
     int cell[DIM];
     config.hash2cell(info.cell_idx - info.batch_idx * config.cell_count, cell);
+    unsigned int share_cap = lane_share_cap(info.candidates_per_row);
     unsigned int start = bin_offsets[info.cell_idx] + info.offset_in_cell;
     unsigned int lane = threadIdx.x & 31;
     unsigned int team = threadIdx.x >> 5;
@@ -483,15 +527,17 @@ __global__ void __launch_bounds__(DensityLayout<DIM, DENSITY_GRAD>::THREADS,
     constexpr int MASS_OFFSET = TILE * Layout::POSITION_FLOATS;
     float h2 = config.eps * config.eps;
 
-    for (unsigned int offset = 0; offset < info.particle_count; offset += 32) {
-        bool valid = offset + lane < info.particle_count;
-        unsigned int particle = start + offset + lane;
+    for (unsigned int offset = 0; offset < info.particle_count;) {
+        unsigned int shift = min(lane_share_shift(info.particle_count - offset), share_cap);
+        unsigned int share = 1u << shift, slot = lane >> shift, sub = lane & (share - 1);
+        bool valid = offset + slot < info.particle_count;
+        unsigned int particle = start + offset + slot;
         ParticlePosition<DIM> position{};
         if (valid)
             position = positions[particle];
         float partial[Layout::PARTIALS] = {0.0f};  // rho, then density gradient
         for_each_neighbor<TILE, Layout::TILE_FLOATS, Layout::BUFFERS, 0>(
-            config, cell, info.batch_idx, bin_offsets, team, valid, position, tiles, h2,
+            config, cell, info.batch_idx, bin_offsets, team, valid, sub, shift, position, tiles, h2,
             [&](unsigned int remote, unsigned int count, float *tile) {
                 if (lane < count) {
                     copy_async_position<DIM>(reinterpret_cast<ParticlePosition<DIM> *>(tile) + lane, positions + remote + lane);
@@ -511,8 +557,10 @@ __global__ void __launch_bounds__(DensityLayout<DIM, DENSITY_GRAD>::THREADS,
                     }
                 }
             });
+        reduce_lanes<Layout::PARTIALS>(partial, share);
         reduce_teams<Layout::PARTIALS, Layout>(partial, shared, team, 0, lane);
-        if (team != 0 || !valid)
+        offset += 32u >> shift;
+        if (team != 0 || !valid || sub != 0)
             continue;
         float rho = partial[0] * config.smoothing_coef;
         volume[particle] = mass[particle] / rho;
@@ -595,6 +643,7 @@ __global__ void __launch_bounds__(ForwardLayout<DIM, FEATURES>::THREADS,
 
     int cell[DIM];
     config.hash2cell(info.cell_idx - info.batch_idx * config.cell_count, cell);
+    unsigned int share_cap = lane_share_cap(info.candidates_per_row);
     unsigned int start = bin_offsets[info.cell_idx] + info.offset_in_cell;
     unsigned int lane = threadIdx.x & 31;
     unsigned int warp = threadIdx.x >> 5;
@@ -609,11 +658,14 @@ __global__ void __launch_bounds__(ForwardLayout<DIM, FEATURES>::THREADS,
     float scale = config.eps / eps0[0];
     float h2 = config.eps * config.eps;
 
-    for (unsigned int offset = 0; offset < info.particle_count; offset += 32) {
+    for (unsigned int offset = 0; offset < info.particle_count;) {
         // Lanes without a particle still load tiles and reach every barrier,
-        // but skip pair work and output.
-        bool valid = offset + lane < info.particle_count;
-        unsigned int particle = start + offset + lane;
+        // but skip pair work and output. Sparse blocks give each particle
+        // several lanes, which split its candidates.
+        unsigned int shift = min(lane_share_shift(info.particle_count - offset), share_cap);
+        unsigned int share = 1u << shift, slot = lane >> shift, sub = lane & (share - 1);
+        bool valid = offset + slot < info.particle_count;
+        unsigned int particle = start + offset + slot;
         ParticlePosition<DIM> position{};
         float local_state[CHANNELS] = {0.0f};
         float partial[PARTIALS] = {0.0f};
@@ -632,7 +684,7 @@ __global__ void __launch_bounds__(ForwardLayout<DIM, FEATURES>::THREADS,
         }
 
         for_each_neighbor<TILE, Layout::TILE_FLOATS, Layout::BUFFERS, POSITION_OFFSET>(
-            config, cell, info.batch_idx, bin_offsets, team, valid, position, tiles, h2,
+            config, cell, info.batch_idx, bin_offsets, team, valid, sub, shift, position, tiles, h2,
             [&](unsigned int remote, unsigned int count, float *tile) {
                 if (lane < count) {
                     copy_async_position<DIM>(reinterpret_cast<ParticlePosition<DIM> *>(tile + POSITION_OFFSET) + lane,
@@ -679,13 +731,16 @@ __global__ void __launch_bounds__(ForwardLayout<DIM, FEATURES>::THREADS,
                     }
                 }
             });
+        reduce_lanes<PARTIALS>(partial, share);
         reduce_teams<PARTIALS, Layout>(partial, shared, team, group, lane);
         if constexpr (NEIGHBOR_WARPS == 1)
             __syncthreads();  // reduce_teams has no barrier; staging aliases every warp's tile.
-        // Team 0 owns the outputs; the other teams join the barriers and copies.
-        bool owner = team == 0 && valid;
-        unsigned int rows = min(32u, info.particle_count - offset);
+        // Team 0's first lane of each particle owns the outputs; the other
+        // lanes and teams join the barriers and copies.
+        bool owner = team == 0 && valid && sub == 0;
+        unsigned int rows = min(32u >> shift, info.particle_count - offset);
         unsigned int first_row = start + offset;
+        offset += 32u >> shift;
 
         if (owner) {
             float matrix[DIM * DIM];
@@ -727,9 +782,9 @@ __global__ void __launch_bounds__(ForwardLayout<DIM, FEATURES>::THREADS,
         constexpr unsigned int GRADIENT_STAGE = 32 * ((FEATURES * (2 + DIM) + DIM) | 1);
         bool stage_gradients = save_backward && normalize_state_grad;
         if (owner) {
-            float *gradient_row = shared + GRADIENT_STAGE + lane * staging_stride(WIDTH);
+            float *gradient_row = shared + GRADIENT_STAGE + slot * staging_stride(WIDTH);
             // Perception rows [state(F), blur(F), gradient(F*DIM), optional density gradient(DIM)].
-            float *row = shared + lane * staging_stride(output_dim);
+            float *row = shared + slot * staging_stride(output_dim);
             #pragma unroll
             for (int c = 0; c < CHANNELS; ++c) {
                 unsigned int channel = first_channel + c;
@@ -854,6 +909,7 @@ __global__ void __launch_bounds__(BackwardLayout<DIM, FEATURES>::THREADS,
 
     int cell[DIM];
     config.hash2cell(info.cell_idx - info.batch_idx * config.cell_count, cell);
+    unsigned int share_cap = lane_share_cap(info.candidates_per_row);
     unsigned int start = bin_offsets[info.cell_idx] + info.offset_in_cell;
     unsigned int lane = threadIdx.x & 31;
     unsigned int warp = threadIdx.x >> 5;
@@ -865,15 +921,17 @@ __global__ void __launch_bounds__(BackwardLayout<DIM, FEATURES>::THREADS,
     constexpr int POSITION_OFFSET = TILE * PAYLOAD;
     float h2 = config.eps * config.eps;
 
-    for (unsigned int offset = 0; offset < info.particle_count; offset += 32) {
-        bool valid = offset + lane < info.particle_count;
-        unsigned int particle = start + offset + lane;
+    for (unsigned int offset = 0; offset < info.particle_count;) {
+        unsigned int shift = min(lane_share_shift(info.particle_count - offset), share_cap);
+        unsigned int share = 1u << shift, slot = lane >> shift, sub = lane & (share - 1);
+        bool valid = offset + slot < info.particle_count;
+        unsigned int particle = start + offset + slot;
         ParticlePosition<DIM> position{};
         if (valid)
             position = positions[particle];
         float result[CHANNELS] = {0.0f};
         for_each_neighbor<TILE, Layout::TILE_FLOATS, Layout::BUFFERS, POSITION_OFFSET>(
-            config, cell, info.batch_idx, bin_offsets, team, valid, position, tiles, h2,
+            config, cell, info.batch_idx, bin_offsets, team, valid, sub, shift, position, tiles, h2,
             [&](unsigned int remote, unsigned int count, float *tile) {
                 if (lane < count)
                     copy_async_position<DIM>(reinterpret_cast<ParticlePosition<DIM> *>(tile + POSITION_OFFSET) + lane,
@@ -912,26 +970,29 @@ __global__ void __launch_bounds__(BackwardLayout<DIM, FEATURES>::THREADS,
                     }
                 }
             });
+        reduce_lanes<CHANNELS>(result, share);
         reduce_teams<CHANNELS, Layout>(result, shared, team, group, lane);
         if constexpr (NEIGHBOR_WARPS == 1)
             __syncthreads();  // reduce_teams has no barrier; staging aliases every warp's tile.
-        // Team 0 stages its sums; all threads then add volume_i * sum to the
-        // rows backward_prepare wrote, coalesced, as one fused multiply-add
-        // (the rounding of the former per-lane `+= volume * sum`).
-        if (team == 0 && valid) {
-            float *row = shared + lane * staging_stride(FEATURES);
+        // Team 0's first lane of each particle stages its sums; all threads
+        // then add volume_i * sum to the rows backward_prepare wrote, coalesced,
+        // as one fused multiply-add (the rounding of the former per-lane
+        // `+= volume * sum`).
+        if (team == 0 && valid && sub == 0) {
+            float *row = shared + slot * staging_stride(FEATURES);
             #pragma unroll
             for (int c = 0; c < CHANNELS; ++c)
                 row[first_channel + c] = result[c];
         }
         __syncthreads();
-        unsigned int rows = min(32u, info.particle_count - offset);
+        unsigned int rows = min(32u >> shift, info.particle_count - offset);
         float *destination = grad_state + (start + offset) * FEATURES;
         for (unsigned int k = threadIdx.x; k < rows * FEATURES; k += Layout::THREADS) {
             unsigned int row = k / FEATURES;
             destination[k] = fmaf(volume[start + offset + row],
                                   shared[row * staging_stride(FEATURES) + k % FEATURES], destination[k]);
         }
+        offset += 32u >> shift;
         __syncthreads();  // The next particle chunk or grid block refills the tiles.
     }
     }

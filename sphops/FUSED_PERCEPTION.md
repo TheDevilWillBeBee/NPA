@@ -112,10 +112,10 @@ four stages; this is a fused perception pipeline, not one monolithic kernel.
 
 | Stage | Work | Scheduling |
 | --- | --- | --- |
-| `density_forward` | Mass-weighted density, optional density gradient, cached volumes | Lane per particle; neighbor-tile warp teams |
-| `forward` | Blur, raw state gradient, moment correction, scaling/log normalization, output packing | Lane per particle (two channel-group warps for 32 channels); neighbor-tile warp teams |
+| `density_forward` | Mass-weighted density, optional density gradient, cached volumes | Lane per particle (several lanes per particle in sparse blocks); neighbor-tile warp teams |
+| `forward` | Blur, raw state gradient, moment correction, scaling/log normalization, output packing | Lane per particle (several lanes per particle in sparse blocks; two channel-group warps for 32 channels); neighbor-tile warp teams |
 | `backward_prepare` | Normalization adjoint, radius scaling, direct/self state contribution, cotangent layout conversion | One thread per particle/channel |
-| `backward` | Combined blur/raw-gradient neighbor adjoints | Lane per particle; neighbor-tile warp teams; no global atomics |
+| `backward` | Combined blur/raw-gradient neighbor adjoints | Lane per particle (several lanes per particle in sparse blocks); neighbor-tile warp teams; no global atomics |
 
 A grid block holds at most `max_particles_per_block` particles of one cell, so
 all of its particles share one neighbor-candidate sequence: three merged-x row
@@ -126,6 +126,27 @@ states and cotangents) with no shuffles, pair geometry and moment terms are comp
 candidates outside the kernel support are skipped. 32 channels use two warps of
 16 channels each to bound registers. Grid blocks larger than 32 particles are
 processed in passes of 32.
+
+A pass with fewer than 17 particles left gives each particle 2, 4 or 8 lanes
+(`lane_share_shift`: at most 16, 8 or 4 particles left), chosen per pass and
+uniform over the block, and capped by the block's candidate density
+(`lane_share_cap`: at least 4, 8 or 16 candidates per neighbor row span for
+2, 4 or 8 lanes). The density is the `candidates_per_row` field of the block
+record, which `assign_block_info` computes once per block from the span
+bounds; `BlockInfo` is therefore 32 bytes (`BLOCK_INFO_WORDS = 8` int32
+words, exported by the extension and read by `sph.py`). The lanes of one
+particle take interleaved candidates of every tile (lane r of the particle
+takes candidates r, r + share, ...), so their shared-memory reads stay in
+distinct banks, and their partial sums are combined with an xor-shuffle
+butterfly before the team reduction; the first lane of each particle then
+owns the outputs. With one lane per particle the plain stride-1 candidate
+loop is kept, since its addresses fold into immediate offsets. Sparse
+arrangements (shapes, 3D cells of about 10 particles) used about half of the
+lanes before; this raises the active lanes per instruction from 16 to 20-25
+of 32 and cuts the instructions of the sparse cases by 12-22%. Dense blocks
+are unchanged, and the cap keeps very sparse blocks (a few candidates per
+tile, where the butterfly would cost more than the split loop saves) at one
+lane per particle.
 
 One lane per particle alone leaves too few warps to hide latency (B=8, N=4096
 is about 1,024 warps). Each grid block therefore runs `NEIGHBOR_WARPS` warp
@@ -234,7 +255,8 @@ The named constants in `fused_perception.cuh` hold the measured settings:
 | `FEATURE_TILE_BUFFERS`, `BACKWARD_TILE_BUFFERS`, `DENSITY_TILE_BUFFERS` | 2 | 1, 2 | Tile buffers per warp; 2 streams the next tile with `cp.async` while the current one is processed (backward 2D shape −10%, 3D −18%; density is neutral in 2D, −12% in 3D) |
 | `REDUCE_STAGING_BYTES` | 21504 | 12288, 21504 | Team-reduction staging may grow beyond the tiles up to this size: one chunk (two barriers) for the 2D forward while four blocks stay resident |
 | `MAX_CHANNELS_PER_THREAD` | 16 | - | 32 channels split across two warps |
-| `max_particles_per_block` | 32 in configs | 16, 32, 64 | 16 leaves half of each lane-per-particle warp idle; prefer 32 or 64 |
+| `max_particles_per_block` | 32 in configs | 16, 32, 64 | Blocks with at most 16 particles share lanes (2-8 per particle), so 16 no longer idles half of each warp, but it still doubles the number of grid blocks and tile loads; prefer 32 or 64 |
+| `lane_share_shift`, `lane_share_cap` | 2/4/8 lanes at <= 16/8/4 particles left, needing >= 4/8/16 candidates per row span | uncapped | Lanes per particle in sparse passes; uncapped, blocks with about 3 candidates per tile (3D ball at a quarter of the configured density) were 20% slower |
 
 Re-tune with the corpus workflow in [BENCHMARKS.md](BENCHMARKS.md): every sweep
 should include forward and backward, dense disk seeds, uniform texture seeds,

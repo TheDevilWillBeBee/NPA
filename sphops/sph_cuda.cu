@@ -20,7 +20,7 @@ using FloatArray3D = nb::ndarray<float, nb::shape<-1, -1, -1>, nb::c_contig, nb:
 using FloatArray4D = nb::ndarray<float, nb::shape<-1, -1, -1, -1>, nb::c_contig, nb::device::cuda>;
 using IntArray1D = nb::ndarray<int32_t, nb::shape<-1>, nb::c_contig, nb::device::cuda>;
 using IntArray2D = nb::ndarray<int32_t, nb::shape<-1, -1>, nb::c_contig, nb::device::cuda>;
-using BlockInfoArray = nb::ndarray<int32_t, nb::shape<-1, 4>, nb::c_contig, nb::device::cuda>;
+using BlockInfoArray = nb::ndarray<int32_t, nb::shape<-1, BLOCK_INFO_WORDS>, nb::c_contig, nb::device::cuda>;
 
 #define cuda_check(call)                                                              \
     do                                                                                \
@@ -228,6 +228,7 @@ template <int DIM, BoundaryCondition BC>
 __global__ void assign_block_info(
     const uint32_t * __restrict__ cell_counts,   // Shape [batch_size * cell_count]
     const uint32_t * __restrict__ block_offsets, // Cumulative sum of blocks per cell (batch_size * cell_count + 1)
+    const uint32_t * __restrict__ bin_offsets,   // Particle offsets per cell (batch_size * cell_count + 1)
     BlockInfo * __restrict__ block_info,         // Output: block information # Shape [batch_size * max_blocks_per_batch]
     GridConfig<DIM, BC> config)
 {
@@ -244,7 +245,7 @@ __global__ void assign_block_info(
     uint32_t threads = gridDim.x * blockDim.x * config.batch_size;
     for (uint32_t i = total_blocks + (batch_idx * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
          i < max_blocks; i += threads)
-        block_info[i] = BlockInfo{0u, 0u, 0u, 0u};
+        block_info[i] = BlockInfo{};
 
     if (cell_idx >= config.cell_count)
         return;
@@ -255,6 +256,19 @@ __global__ void assign_block_info(
     if (particles_in_cell == 0)
         return;
 
+    // Average candidates per neighbor row span of this cell, from the span
+    // bounds: the fused kernels choose how many lanes share a particle from it.
+    constexpr int ROWS = GridConfig<DIM, BC>::NEIGHBOR_ROWS, WRAPS = GridConfig<DIM, BC>::WRAP_CHUNKS;
+    int cell[DIM];
+    config.hash2cell(cell_idx, cell);
+    uint32_t candidates = 0;
+    for (int span = 0; span < ROWS * WRAPS; ++span)
+    {
+        unsigned int begin, end;
+        if (config.neighbor_span(cell, batch_idx, span / WRAPS, span % WRAPS, bin_offsets, begin, end))
+            candidates += end - begin;
+    }
+
     // Get the starting block index for this cell within the batch
     uint32_t batch_offset_base = batch_idx * config.cell_count;
     uint32_t block_base_idx = block_offsets[batch_offset_base + cell_idx];
@@ -263,7 +277,8 @@ __global__ void assign_block_info(
     for (uint32_t block_num = 0; block_num < blocks_needed; ++block_num)
     {
         // Fill in the BlockInfo structure
-        BlockInfo info;
+        BlockInfo info{};
+        info.candidates_per_row = candidates / ROWS;
         info.cell_idx = global_cell_idx;                                  // Use global cell index
         info.offset_in_cell = block_num * config.MAX_PARTICLES_PER_BLOCK; // Fix: this should be byte offset, not block number
         info.particle_count = min(config.MAX_PARTICLES_PER_BLOCK,
@@ -1343,7 +1358,7 @@ public:
         block_dim = dim3(256, 1, 1);
         grid_dim = dim3((m_config.cell_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
         assign_block_info<<<grid_dim, block_dim, 0, stream>>>(
-            m_cell_counts, m_block_offsets, d_block_info, m_config);
+            m_cell_counts, m_block_offsets, d_bin_offsets, d_block_info, m_config);
         cuda_check(cudaGetLastError());
     }
 
@@ -1351,13 +1366,13 @@ public:
         FloatArray3D positions,   // Shape (batch_size, N, DIM)
         IntArray2D permutation,   // Shape (batch_size, N)
         IntArray1D bin_offsets,   // Shape (batch_size * cell_count + 1)
-        BlockInfoArray block_info // Shape (max_blocks, 4)
+        BlockInfoArray block_info // Shape (max_blocks, BLOCK_INFO_WORDS)
     )
     {
         validate_array_shape(positions, per_particle({m_dimension}), "positions");
         validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
         validate_array_shape(permutation, per_particle(), "permutation");
-        validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
+        validate_array_shape(block_info, {m_max_blocks, static_cast<decltype(m_max_blocks)>(BLOCK_INFO_WORDS)}, "block_info");
 
         initialize_impl(reinterpret_cast<const ParticlePosition<DIM> *>(positions.data()),
                         reinterpret_cast<uint32_t *>(permutation.data()),
@@ -1463,11 +1478,11 @@ public:
 
     size_t fused_snapshot_words() const
     {
-        return size_t(m_max_blocks) * 4 + size_t(m_config.batch_size) * m_config.cell_count + 1
+        return size_t(m_max_blocks) * BLOCK_INFO_WORDS + size_t(m_config.batch_size) * m_config.cell_count + 1
              + size_t(m_config.batch_size) * m_config.particle_count;
     }
 
-    // The snapshot's int32 words: [block_info (max_blocks*4) | bin_offsets (B*cells+1) | permutation (B*N)].
+    // The snapshot's int32 words: [block_info (max_blocks*BLOCK_INFO_WORDS) | bin_offsets (B*cells+1) | permutation (B*N)].
     struct SnapshotView
     {
         BlockInfo *block_info;
@@ -1478,7 +1493,7 @@ public:
     SnapshotView snapshot_view(IntArray1D &snapshot) const
     {
         auto *words = reinterpret_cast<uint32_t *>(snapshot.data());
-        uint32_t *bin_offsets = words + size_t(m_max_blocks) * 4;
+        uint32_t *bin_offsets = words + size_t(m_max_blocks) * BLOCK_INFO_WORDS;
         return {reinterpret_cast<BlockInfo *>(words), bin_offsets,
                 bin_offsets + size_t(m_config.batch_size) * m_config.cell_count + 1};
     }
@@ -1739,7 +1754,7 @@ private:
     {
         validate_array_shape(binned_positions, per_particle({m_dimension}), "binned_positions");
         validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
+        validate_array_shape(block_info, {m_max_blocks, static_cast<decltype(m_max_blocks)>(BLOCK_INFO_WORDS)}, "block_info");
         OperatorArgs args;
         args.positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
         args.bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
@@ -1771,7 +1786,7 @@ private:
 public:
     // Standalone SPH operators on binned particles. Shapes: positions (B, N, DIM),
     // mass, rho and count (B, N), states (B, N, C), bin_offsets (B * cells + 1),
-    // block_info (max_blocks, 4). Shared-memory sizes are floats per tile slot.
+    // block_info (max_blocks, BLOCK_INFO_WORDS). Shared-memory sizes are floats per tile slot.
 
     void density_forward(FloatArray3D binned_positions, FloatArray2D mass, FloatArray2D rho,
                          IntArray1D bin_offsets, BlockInfoArray block_info)
@@ -2083,7 +2098,7 @@ void safe_inv_sym_mat(
              "Initialize the grid with particle positions. 'positions' should have shape " pos_shape                              \
              " 'bin_offsets' should have shape (batch_size, cell_count + 1). "                                                    \
              "'permutation' should have shape (batch_size, N). "                                                                  \
-             "'block_info' should have shape (max_blocks, 4).")                                                                   \
+             "'block_info' should have shape (max_blocks, BLOCK_INFO_WORDS).")                                                                   \
                                                                                                                                   \
         .def("bin_particles", &GridType::bin_particles,                                                                           \
                "input_positions"_a, "input_state"_a, "input_mass"_a, "permutation"_a, "output_positions"_a, "output_state"_a,      \
@@ -2106,7 +2121,7 @@ void safe_inv_sym_mat(
              "'mass' should have shape (batch_size, N). "                                                                         \
              "'bin_offsets' should have shape (batch_size, cell_count + 1). "                                                     \
              "'Rho' should have shape (batch_size, N). "                                                                          \
-             "'block_info' should have shape (max_blocks, 4).")                                                                   \
+             "'block_info' should have shape (max_blocks, BLOCK_INFO_WORDS).")                                                                   \
                                                                                                                                   \
         .def("count_forward", &GridType::count_forward,                                                                           \
              "binned_positions"_a, "count"_a, "bin_offsets"_a, "block_info"_a,                                                    \
@@ -2114,7 +2129,7 @@ void safe_inv_sym_mat(
              "'binned_positions' should have shape " pos_shape ". "                                                               \
              "'bin_offsets' should have shape (batch_size, cell_count + 1). "                                                     \
              "'count' should have shape (batch_size, N). "                                                                        \
-             "'block_info' should have shape (max_blocks, 4).")                                                                   \
+             "'block_info' should have shape (max_blocks, BLOCK_INFO_WORDS).")                                                                   \
         .def("blur_forward", &GridType::blur_forward,                                                                             \
              "binned_positions"_a, "rho"_a, "mass"_a, "state_in"_a, "state_out"_a, "bin_offsets"_a, "block_info"_a,               \
              "Compute local particle state blur based on binned positions and input density. "                                    \
@@ -2123,7 +2138,7 @@ void safe_inv_sym_mat(
              "'rho' should have shape (batch_size, N). "                                                                          \
              "'mass' should have shape (batch_size, N). "                                                                         \
              "'state_in' and 'state_out' should have shape (batch_size, N, feature_dim)."                                         \
-             "'block_info' should have shape (max_blocks, 4).")                                                                   \
+             "'block_info' should have shape (max_blocks, BLOCK_INFO_WORDS).")                                                                   \
         .def("gradient_forward", &GridType::gradient_forward,                                                                     \
              "binned_positions"_a, "rho"_a, "mass"_a, "state_in"_a, "state_gradient_out"_a, "bin_offsets"_a, "block_info"_a,      \
              "Compute local particle state gradient based on binned positions and input density. "                                \
@@ -2133,7 +2148,7 @@ void safe_inv_sym_mat(
              "'mass' should have shape (batch_size, N). "                                                                         \
              "'state_in' should have shape (batch_size, N, feature_dim). "                                                        \
              "'state_gradient_out' should have shape (batch_size, N, feature_dim, DIM)."                                          \
-             "'block_info' should have shape (max_blocks, 4).")                                                                   \
+             "'block_info' should have shape (max_blocks, BLOCK_INFO_WORDS).")                                                                   \
         .def("density_gradient_forward", &GridType::density_gradient_forward,                                                     \
              "binned_positions"_a, "mass"_a, "density_gradient_out"_a, "bin_offsets"_a, "block_info"_a,                           \
              "Compute local particle density gradient based on binned positions and input density. "                              \
@@ -2141,7 +2156,7 @@ void safe_inv_sym_mat(
              "'bin_offsets' should have shape (batch_size, cell_count + 1). "                                                     \
              "'mass' should have shape (batch_size, N). "                                                                         \
              "'density_gradient_out' should have shape (batch_size, N, DIM)."                                                     \
-             "'block_info' should have shape (max_blocks, 4).")                                                                   \
+             "'block_info' should have shape (max_blocks, BLOCK_INFO_WORDS).")                                                                   \
         .def("moment_matrix_forward", &GridType::moment_matrix_forward,                                                           \
              "binned_positions"_a, "rho"_a, "mass"_a, "moment_matrix_out"_a, "bin_offsets"_a, "block_info"_a,                     \
              "Compute local particle moment matrix based on binned positions and input density. "                                 \
@@ -2150,7 +2165,7 @@ void safe_inv_sym_mat(
              "'rho' should have shape (batch_size, N). "                                                                          \
              "'mass' should have shape (batch_size, N). "                                                                         \
              "'moment_matrix_out' should have shape (batch_size, N, DIM, DIM)."                                                   \
-             "'block_info' should have shape (max_blocks, 4).")                                                                   \
+             "'block_info' should have shape (max_blocks, BLOCK_INFO_WORDS).")                                                                   \
                                                                                                                                   \
         .def("density_backward", &GridType::density_backward,                                                                     \
              "binned_positions"_a, "mass"_a, "dL_rho_out"_a, "grad_x"_a, "bin_offsets"_a, "block_info"_a, nb::arg("dLdx") = true, \
@@ -2159,7 +2174,7 @@ void safe_inv_sym_mat(
              "'bin_offsets' should have shape (batch_size, cell_count + 1). "                                                     \
              "'dL_rho_out' should have shape (batch_size, N). "                                                                   \
              "'grad_x' should have shape (batch_size, N, DIM). "                                                                  \
-             "'block_info' should have shape (max_blocks, 4). "                                                                   \
+             "'block_info' should have shape (max_blocks, BLOCK_INFO_WORDS). "                                                                   \
              "'dLdx' indicates whether to compute gradient w.r.t. position.")                                                     \
         .def("blur_backward", &GridType::blur_backward,                                                                           \
              "binned_positions"_a, "rho"_a, "mass"_a, "state_in"_a, "dL_blur_state_out"_a, "grad_x"_a,                            \
@@ -2175,7 +2190,7 @@ void safe_inv_sym_mat(
              "'grad_x' should have shape (batch_size, N, DIM). "                                                                  \
              "'grad_s' should have shape (batch_size, N, feature_dim). "                                                          \
              "'grad_rho' should have shape (batch_size, N). "                                                                     \
-             "'block_info' should have shape (max_blocks, 4). "                                                                   \
+             "'block_info' should have shape (max_blocks, BLOCK_INFO_WORDS). "                                                                   \
              "'dLdx', 'dLds', and 'dLdrho' indicate whether to compute"                                                           \
              " gradient w.r.t. position, state, and density respectively.")                                                       \
         .def("density_gradient_backward", &GridType::density_gradient_backward,                                                   \
@@ -2186,7 +2201,7 @@ void safe_inv_sym_mat(
              "'bin_offsets' should have shape (batch_size, cell_count + 1). "                                                     \
              "'dL_density_gradient_out' should have shape (batch_size, N, DIM). "                                                 \
              "'grad_x' should have shape (batch_size, N, DIM). "                                                                  \
-             "'block_info' should have shape (max_blocks, 4). "                                                                   \
+             "'block_info' should have shape (max_blocks, BLOCK_INFO_WORDS). "                                                                   \
              "'dLdx' indicates whether to compute gradient w.r.t. position.")                                                     \
         .def("gradient_backward", &GridType::gradient_backward,                                                                   \
              "binned_positions"_a, "rho"_a, "mass"_a, "state_in"_a, "dL_grad_state_out"_a, "grad_x"_a,                            \
@@ -2202,7 +2217,7 @@ void safe_inv_sym_mat(
              "'grad_x' should have shape (batch_size, N, DIM). "                                                                  \
              "'grad_s' should have shape (batch_size, N, feature_dim). "                                                          \
              "'grad_rho' should have shape (batch_size, N). "                                                                     \
-             "'block_info' should have shape (max_blocks, 4). "                                                                   \
+             "'block_info' should have shape (max_blocks, BLOCK_INFO_WORDS). "                                                                   \
              "'dLdx', 'dLds', and 'dLdrho' indicate whether to compute"                                                           \
              " gradient w.r.t. position, state, and density respectively.")                                                       \
         .def("moment_matrix_backward", &GridType::moment_matrix_backward,                                                         \
@@ -2217,12 +2232,13 @@ void safe_inv_sym_mat(
              "'dL_moment_matrix_out' should have shape (batch_size, N, DIM, DIM). "                                               \
              "'grad_x' should have shape (batch_size, N, DIM). "                                                                  \
              "'grad_rho' should have shape (batch_size, N). "                                                                     \
-             "'block_info' should have shape (max_blocks, 4). "                                                                   \
+             "'block_info' should have shape (max_blocks, BLOCK_INFO_WORDS). "                                                                   \
              "'dLdx' and 'dLdrho' indicate whether to compute"                                                                    \
              " gradient w.r.t. position and density respectively.")
 
 NB_MODULE(sph_cuda, m)
 {
+    m.attr("BLOCK_INFO_WORDS") = BLOCK_INFO_WORDS;
     // 2D HashGrid
     auto grid2d_periodic = nb::class_<HashGrid2DPeriodic>(m, "HashGrid2DPeriodic")
                                .def(nb::init<int, int, float, uint32_t, uint32_t, uint32_t>(),

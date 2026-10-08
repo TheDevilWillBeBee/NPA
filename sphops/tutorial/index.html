@@ -229,6 +229,7 @@ html.js .js-only { display: flex; }
     <li><a href="#registers"><span class="step">8</span>Registers and occupancy</a></li>
     <li><a href="#host"><span class="step">9</span>The host side</a></li>
     <li><a href="#round2"><span class="step">10</span>A second round</a></li>
+    <li><a href="#lanes"><span class="step">11</span>Several lanes per particle</a></li>
     <li><a href="#results">Results</a></li>
     <li><a href="#correct">Checking correctness</a></li>
     <li><a href="#files">Where to find things</a></li>
@@ -485,7 +486,7 @@ html.js .js-only { display: flex; }
           typename Load, typename Pair&gt;
 __device__ __forceinline__ void for_each_neighbor(
     const GridConfig&lt;DIM, BC&gt; &amp;config, const int *cell, unsigned int batch, const uint32_t *bin_offsets,
-    unsigned int team, bool valid, const ParticlePosition&lt;DIM&gt; &amp;position,
+    unsigned int team, bool valid, unsigned int sub, unsigned int shift, const ParticlePosition&lt;DIM&gt; &amp;position,
     float *tiles, float h2, Load load, Pair pair)
 {
     TileCursor&lt;TILE, DIM, BC&gt; cursor(config, cell, batch, bin_offsets, team);
@@ -510,12 +511,18 @@ __device__ __forceinline__ void for_each_neighbor(
         __syncwarp();  <span class="c">// Every lane's copies of the current tile are visible.</span>
         if (valid) {
             const auto *tile_pos = reinterpret_cast&lt;const ParticlePosition&lt;DIM&gt; *&gt;(tile + POSITION_OFFSET);
-            for (unsigned int j = 0; j &lt; count; ++j) {
+            auto candidate = [&amp;](unsigned int j) {
                 ParticlePosition&lt;DIM&gt; r = config.displacement(position, tile_pos[j]);
                 float d2 = dot(r, r);
-                if (d2 &gt;= h2)
-                    continue;
-<span class="hl">                pair(j, r, d2, tile);</span>
+                if (d2 &lt; h2)
+<span class="hl">                    pair(j, r, d2, tile);</span>
+            };
+            ...
+            if (shift == 0) {
+                for (unsigned int j = 0; j &lt; count; ++j)
+                    candidate(j);
+            } else {
+                ...  <span class="c">// several lanes per particle, step 11</span>
             }
         }
         __syncwarp();  <span class="c">// Finish reading this buffer before it is refilled.</span>
@@ -651,7 +658,7 @@ if (prev_count % config.MAX_PARTICLES_PER_BLOCK == 0)
   <text class="ts" x="580" y="96">a grid block never crosses a cell.</text>
   <text class="ts" x="580" y="112">Its slots are consecutive.</text>
 
-  <text class="th" x="20" y="156">4 · BlockInfo {cell, offset_in_cell, count}: one record per grid block, written at block_offsets[cell] + k</text>
+  <text class="th" x="20" y="156">4 · BlockInfo {cell, offset_in_cell, count, batch, candidates_per_row}: one per grid block, at block_offsets[cell] + k</text>
   <g class="f-ls blk">
     <rect x="20" y="166" width="58" height="60" rx="4"/><rect x="82" y="166" width="58" height="60" rx="4"/><rect x="144" y="166" width="58" height="60" rx="4"/><rect x="206" y="166" width="58" height="60" rx="4"/><rect x="268" y="166" width="58" height="60" rx="4"/><rect x="330" y="166" width="58" height="60" rx="4"/>
   </g>
@@ -684,13 +691,14 @@ permutation[idx] += bin_offsets[batch_idx * config.cell_count + hash] - batch_id
 </div>
 
 <div class="code-block">
-<div class="code-label">sph_cuda.cu · block records (assign_block_info, one thread per cell)</div>
+<div class="code-label">sph_cuda.cu · block records (assign_block_info, one thread per cell; candidates_per_row serves step 11)</div>
 <pre><code>uint32_t block_base_idx = block_offsets[batch_offset_base + cell_idx];
 uint32_t blocks_needed = (particles_in_cell + config.MAX_PARTICLES_PER_BLOCK - 1) / config.MAX_PARTICLES_PER_BLOCK;
 
 for (uint32_t block_num = 0; block_num &lt; blocks_needed; ++block_num)
 {
     ...
+    info.candidates_per_row = candidates / ROWS;
     info.cell_idx = global_cell_idx;                                  <span class="c">// Use global cell index</span>
     info.offset_in_cell = block_num * config.MAX_PARTICLES_PER_BLOCK; <span class="c">// Fix: this should be byte offset, not block number</span>
     info.particle_count = min(config.MAX_PARTICLES_PER_BLOCK,
@@ -719,7 +727,7 @@ if (info.particle_count == 0)
 
 <div class="note measure">
   <span class="label">Measured: the empty tail</span>
-  <p>In 2D (16 × 16 cells, N = 4,096, cap 32) the launch is min(4,096, 256 + 128) = 384 blocks per sample, 3,072 for the batch of 8 (grid size in all six Nsight reports). The shape case uses 218 of the 384 per sample (geometry above), so about 43% of the launched CUDA blocks exit at once. In 3D (32³ cells, N = 16,384, cap 64, batch 4) the launch is min(16,384, 32,768 + 256) = 16,384 per sample, 65,536 in total (Nsight report ball_3d). The ball seed has about 3.7 particles per occupied cell (BENCHMARKS.md), so about 4,400 blocks per sample have work and about 73% of the records are empty. Since the second round (step 10) the kernels no longer launch one CUDA block per record: a CUDA block loops over the records <span class="math">blockIdx.x, blockIdx.x + gridDim.x, …</span> and stops at the first empty one, and the launch is at most eight waves of resident blocks (4,096 for the forward in 3D instead of 65,536). The empty tail then costs one 16-byte read per CUDA block.</p>
+  <p>In 2D (16 × 16 cells, N = 4,096, cap 32) the launch is min(4,096, 256 + 128) = 384 blocks per sample, 3,072 for the batch of 8 (grid size in all six Nsight reports). The shape case uses 218 of the 384 per sample (geometry above), so about 43% of the launched CUDA blocks exit at once. In 3D (32³ cells, N = 16,384, cap 64, batch 4) the launch is min(16,384, 32,768 + 256) = 16,384 per sample, 65,536 in total (Nsight report ball_3d). The ball seed has about 3.7 particles per occupied cell (BENCHMARKS.md), so about 4,400 blocks per sample have work and about 73% of the records are empty. Since the second round (step 10) the kernels no longer launch one CUDA block per record: a CUDA block loops over the records <span class="math">blockIdx.x, blockIdx.x + gridDim.x, …</span> and stops at the first empty one, and the launch is at most eight waves of resident blocks (4,096 for the forward in 3D instead of 65,536). The empty tail then costs one record read (32 bytes since step 11) per CUDA block.</p>
 </div>
 
 <p>The whole grid build is 6 launches: one memset for both counter arrays, the count kernel, two kernels for one CUB scan that produces <code>bin_offsets</code> and <code>block_offsets</code> at once (a scan over zipped pairs), the scatter kernel, which in the fused path also copies positions, states and masses into binned order, and the record kernel, which also writes the empty tail. All of them are ordered on the caller's CUDA stream. It used to be 14 launches (BENCHMARKS.md), then 9 after the rank trick and the removal of memsets for buffers that are fully overwritten anyway, and 6 since the second round (step 10).</p>
@@ -1048,7 +1056,7 @@ __device__ __forceinline__ bool neighbor_span(const int *cell, unsigned int batc
 <div class="code-block">
 <div class="code-label">fused_perception.cuh · forward: the load and pair callbacks of the backbone</div>
 <pre><code>for_each_neighbor&lt;TILE, Layout::TILE_FLOATS, Layout::BUFFERS, POSITION_OFFSET&gt;(
-    config, cell, info.batch_idx, bin_offsets, team, valid, position, tiles, h2,
+    config, cell, info.batch_idx, bin_offsets, team, valid, sub, shift, position, tiles, h2,
     [&amp;](unsigned int remote, unsigned int count, float *tile) {
         if (lane &lt; count) {
             copy_async_position&lt;DIM&gt;(reinterpret_cast&lt;ParticlePosition&lt;DIM&gt; *&gt;(tile + POSITION_OFFSET) + lane,
@@ -1509,9 +1517,9 @@ constexpr unsigned int WIDTH = FEATURES * DIM;
 constexpr unsigned int GRADIENT_STAGE = 32 * ((FEATURES * (2 + DIM) + DIM) | 1);
 bool stage_gradients = save_backward &amp;&amp; normalize_state_grad;
 if (owner) {
-    float *gradient_row = shared + GRADIENT_STAGE + lane * staging_stride(WIDTH);
+    float *gradient_row = shared + GRADIENT_STAGE + slot * staging_stride(WIDTH);
     <span class="c">// Perception rows [state(F), blur(F), gradient(F*DIM), optional density gradient(DIM)].</span>
-<span class="hl">            float *row = shared + lane * staging_stride(output_dim);</span>
+<span class="hl">            float *row = shared + slot * staging_stride(output_dim);</span>
     #pragma unroll
     for (int c = 0; c &lt; CHANNELS; ++c) {
         unsigned int channel = first_channel + c;
@@ -1904,7 +1912,136 @@ rgb.scatter_add_(0, flat_idx.expand(-1, 3), c.reshape(-1, 3))</code></pre>
 </div>
 <p class="table-note">Kernel columns: Nsight Compute at locked base clocks, one profiled call per build, before → after the second round (the binning order changes between processes, which moves the kernel times of identical code by up to about 5%). Per-call columns: sum of all kernels of one <code>fused_perception</code> call under the profiler at normal clocks, three interleaved rounds, including grid build and binning; the backward sum includes the unbinning kernel, which went from 13 to 5 µs in 2D. Details and the rejected experiments (balanced candidate ranges, a team-split epilogue, a software-pipelined inner loop, 20 resident warps, a greedy tile assignment) are in BENCHMARKS.md.</p>
 
-<p>What did not help is as informative as what did. Giving each team an equal share of the candidates removed the barrier waits but needed two passes over the spans and more partial tiles; the forward is bound by instruction issue, so the extra instructions cost more than the waits. Splitting the epilogue over the four teams rested on a wrong estimate: the SASS profile showed the epilogue at about 2% of the sparse forward, not 25%. The lesson from the profile is that the pair loop is about 90% of the instructions, 80 of its 100 instructions per candidate are floating-point, and half of the lanes are idle on average. Further gains need either fewer idle lanes, which means a different candidate structure, or fewer floating-point instructions per pair.</p>
+<p>What did not help is as informative as what did. Giving each team an equal share of the candidates removed the barrier waits but needed two passes over the spans and more partial tiles; the forward is bound by instruction issue, so the extra instructions cost more than the waits. Splitting the epilogue over the four teams rested on a wrong estimate: the SASS profile showed the epilogue at about 2% of the sparse forward, not 25%. The lesson from the profile is that the pair loop is about 90% of the instructions, 80 of its 100 instructions per candidate are floating-point, and half of the lanes are idle on average. Further gains need either fewer idle lanes, which means a different candidate structure, or fewer floating-point instructions per pair. Step 11 takes the first route.</p>
+
+<h2 id="lanes"><span class="eyebrow">Step 11</span>Several lanes per particle</h2>
+
+<p>Step 10 ended with the profile's verdict: in the sparse arrangements half of the lanes are idle. The reason is the mapping of step 4. A grid block with six particles runs a warp with six working lanes, and every one of them walks all candidates of every tile. The ball seed in 3D has about ten particles per cell, the shapes have thin boundaries, and even the dense disk ends every block with a ragged last pass. The fix keeps the backbone and changes only who walks the candidates: when a pass has at most 16, 8 or 4 particles left, each particle gets 2, 4 or 8 lanes.</p>
+
+<figure>
+<div class="svg-wrap">
+<svg viewBox="0 0 780 290" role="img" aria-label="A warp of 32 lanes processing a grid block of six particles. Before: six lanes active, 26 idle, each active lane walks all 32 candidates of the tile. After: four lanes per particle, 24 lanes active in six groups, each lane walks eight interleaved candidates, then an xor butterfly combines the four partial sums of a group.">
+  <text class="tsm" x="40" y="20">shared memory: one tile, 32 candidates</text>
+  <rect class="f-ss s-s" x="40" y="28" width="704" height="16"/>
+  <g class="s-s nf"><path d="M61 28v16M83 28v16M105 28v16M127 28v16M149 28v16M171 28v16M193 28v16M215 28v16M237 28v16M259 28v16M281 28v16M303 28v16M325 28v16M347 28v16M369 28v16M391 28v16M413 28v16M435 28v16M457 28v16M479 28v16M501 28v16M523 28v16M545 28v16M567 28v16M589 28v16M611 28v16M633 28v16M655 28v16M677 28v16M699 28v16M721 28v16"/></g>
+  <text class="ts" x="40" y="70">one lane per particle (step 4): 6 lanes each walk the 32 candidates, 26 lanes idle</text>
+  <rect class="lane on" x="40" y="78" width="20" height="20"/><rect class="lane on" x="62" y="78" width="20" height="20"/><rect class="lane on" x="84" y="78" width="20" height="20"/><rect class="lane on" x="106" y="78" width="20" height="20"/><rect class="lane on" x="128" y="78" width="20" height="20"/><rect class="lane on" x="150" y="78" width="20" height="20"/><rect class="lane off" x="172" y="78" width="20" height="20"/><rect class="lane off" x="194" y="78" width="20" height="20"/><rect class="lane off" x="216" y="78" width="20" height="20"/><rect class="lane off" x="238" y="78" width="20" height="20"/><rect class="lane off" x="260" y="78" width="20" height="20"/><rect class="lane off" x="282" y="78" width="20" height="20"/><rect class="lane off" x="304" y="78" width="20" height="20"/><rect class="lane off" x="326" y="78" width="20" height="20"/><rect class="lane off" x="348" y="78" width="20" height="20"/><rect class="lane off" x="370" y="78" width="20" height="20"/><rect class="lane off" x="392" y="78" width="20" height="20"/><rect class="lane off" x="414" y="78" width="20" height="20"/><rect class="lane off" x="436" y="78" width="20" height="20"/><rect class="lane off" x="458" y="78" width="20" height="20"/><rect class="lane off" x="480" y="78" width="20" height="20"/><rect class="lane off" x="502" y="78" width="20" height="20"/><rect class="lane off" x="524" y="78" width="20" height="20"/><rect class="lane off" x="546" y="78" width="20" height="20"/><rect class="lane off" x="568" y="78" width="20" height="20"/><rect class="lane off" x="590" y="78" width="20" height="20"/><rect class="lane off" x="612" y="78" width="20" height="20"/><rect class="lane off" x="634" y="78" width="20" height="20"/><rect class="lane off" x="656" y="78" width="20" height="20"/><rect class="lane off" x="678" y="78" width="20" height="20"/><rect class="lane off" x="700" y="78" width="20" height="20"/><rect class="lane off" x="722" y="78" width="20" height="20"/>
+  <g class="tms mid"><text x="106" y="114">lanes 0–5 = particles a–f</text><text x="460" y="114">lanes 6–31 idle</text></g>
+  <text class="ts" x="40" y="150">four lanes per particle (step 11): 24 lanes each walk 8 candidates, j = r, r + 4, r + 8, …; 8 lanes idle</text>
+  <rect class="lane on" x="40" y="158" width="20" height="20"/><rect class="lane on" x="62" y="158" width="20" height="20"/><rect class="lane on" x="84" y="158" width="20" height="20"/><rect class="lane on" x="106" y="158" width="20" height="20"/><rect class="lane on" x="128" y="158" width="20" height="20"/><rect class="lane on" x="150" y="158" width="20" height="20"/><rect class="lane on" x="172" y="158" width="20" height="20"/><rect class="lane on" x="194" y="158" width="20" height="20"/><rect class="lane on" x="216" y="158" width="20" height="20"/><rect class="lane on" x="238" y="158" width="20" height="20"/><rect class="lane on" x="260" y="158" width="20" height="20"/><rect class="lane on" x="282" y="158" width="20" height="20"/><rect class="lane on" x="304" y="158" width="20" height="20"/><rect class="lane on" x="326" y="158" width="20" height="20"/><rect class="lane on" x="348" y="158" width="20" height="20"/><rect class="lane on" x="370" y="158" width="20" height="20"/><rect class="lane on" x="392" y="158" width="20" height="20"/><rect class="lane on" x="414" y="158" width="20" height="20"/><rect class="lane on" x="436" y="158" width="20" height="20"/><rect class="lane on" x="458" y="158" width="20" height="20"/><rect class="lane on" x="480" y="158" width="20" height="20"/><rect class="lane on" x="502" y="158" width="20" height="20"/><rect class="lane on" x="524" y="158" width="20" height="20"/><rect class="lane on" x="546" y="158" width="20" height="20"/><rect class="lane off" x="568" y="158" width="20" height="20"/><rect class="lane off" x="590" y="158" width="20" height="20"/><rect class="lane off" x="612" y="158" width="20" height="20"/><rect class="lane off" x="634" y="158" width="20" height="20"/><rect class="lane off" x="656" y="158" width="20" height="20"/><rect class="lane off" x="678" y="158" width="20" height="20"/><rect class="lane off" x="700" y="158" width="20" height="20"/><rect class="lane off" x="722" y="158" width="20" height="20"/>
+  <path class="s-k" style="fill:none" d="M40 184 v6 h86 v-6"/><path class="s-k" style="fill:none" d="M128 184 v6 h86 v-6"/><path class="s-k" style="fill:none" d="M216 184 v6 h86 v-6"/><path class="s-k" style="fill:none" d="M304 184 v6 h86 v-6"/><path class="s-k" style="fill:none" d="M392 184 v6 h86 v-6"/><path class="s-k" style="fill:none" d="M480 184 v6 h86 v-6"/>
+  <g class="tms mid"><text x="83" y="202">a</text><text x="171" y="202">b</text><text x="259" y="202">c</text><text x="347" y="202">d</text><text x="435" y="202">e</text><text x="523" y="202">f</text><text x="656" y="202">idle</text></g>
+  <text class="ts" x="40" y="234">then an xor butterfly inside each group of four: after two shuffle steps all four lanes hold the particle's sums</text>
+  <g class="s-r" style="fill:none"><path d="M50 262 Q61 246 72 262"/><path d="M94 262 Q105 246 116 262"/><path d="M50 276 Q72 292 94 276"/><path d="M72 276 Q94 292 116 276"/></g>
+  <g class="tms"><text x="130" y="258">step 1: lane r ↔ r xor 1</text><text x="130" y="282">step 2: lane r ↔ r xor 2</text></g>
+</svg>
+</div>
+<figcaption><b>Sharing a particle between lanes.</b> Purple lanes work, grey lanes idle. The tile is still copied by all 32 lanes and read by all lanes at once; only the candidate loop is split. The lanes of one particle take interleaved candidates, so at any moment they read neighbouring tile rows, which sit in different shared-memory banks.</figcaption>
+</figure>
+
+<p>The pass loop of each kernel chooses the share per pass, uniformly for the block, so no branch diverges inside a warp. <span class="math">slot</span> is the particle within the pass, <span class="math">sub</span> the lane's rank within its particle. The share is also capped by the block's candidate density (<code>share_cap</code>): the butterfly costs one shuffle per partial sum and step, 53 partials in the 2D forward and 73 in 3D, so eight lanes per particle only pay when each tile has enough candidates to split. The density is a new field of the block record, <code>candidates_per_row</code>, which the record kernel of step 1 sums from the span bounds once per cell (the record grew from 16 to 32 bytes):</p>
+
+<div class="code-block">
+<div class="code-label">fused_perception.cuh · the forward pass loop with shared lanes</div>
+<pre><code>__device__ __forceinline__ unsigned int lane_share_shift(unsigned int remaining)
+{
+    return remaining &lt;= 4 ? 3u : remaining &lt;= 8 ? 2u : remaining &lt;= 16 ? 1u : 0u;
+}
+...
+__device__ __forceinline__ unsigned int lane_share_cap(unsigned int per_row)
+{
+    return per_row &gt;= 16 ? 3u : per_row &gt;= 8 ? 2u : per_row &gt;= 4 ? 1u : 0u;
+}
+...
+    unsigned int share_cap = lane_share_cap(info.candidates_per_row);
+...
+    for (unsigned int offset = 0; offset &lt; info.particle_count;) {
+        <span class="c">// Lanes without a particle still load tiles and reach every barrier,</span>
+        <span class="c">// but skip pair work and output. Sparse blocks give each particle</span>
+        <span class="c">// several lanes, which split its candidates.</span>
+<span class="hl">        unsigned int shift = min(lane_share_shift(info.particle_count - offset), share_cap);</span>
+<span class="hl">        unsigned int share = 1u &lt;&lt; shift, slot = lane &gt;&gt; shift, sub = lane &amp; (share - 1);</span>
+        bool valid = offset + slot &lt; info.particle_count;
+        unsigned int particle = start + offset + slot;
+...
+<span class="hl">        reduce_lanes&lt;PARTIALS&gt;(partial, share);</span>
+        reduce_teams&lt;PARTIALS, Layout&gt;(partial, shared, team, group, lane);
+...
+        bool owner = team == 0 &amp;&amp; valid &amp;&amp; sub == 0;
+        unsigned int rows = min(32u &gt;&gt; shift, info.particle_count - offset);
+        unsigned int first_row = start + offset;
+        offset += 32u &gt;&gt; shift;</code></pre>
+</div>
+
+<p>Inside <code>for_each_neighbor</code> the candidate loop gained a second branch. With one lane per particle the old stride-1 loop stays, because its addresses fold into immediate offsets of the unrolled loads. With shared lanes the loop starts at <span class="math">sub</span> and strides by the share. The first version used the strided loop everywhere; it cost two or three integer instructions per candidate, which the dense density kernel, at about 20 instructions per candidate, paid as 15%. The partial sums are combined with <code>__shfl_xor_sync</code>, the same tree in every lane, so the result is deterministic and every lane of the group ends with the same total; the team reduction and the output staging then run as before, indexed by <span class="math">slot</span> instead of <span class="math">lane</span>.</p>
+
+<div class="code-block">
+<div class="code-label">fused_perception.cuh · the two candidate loops and the butterfly</div>
+<pre><code>            if (shift == 0) {
+                for (unsigned int j = 0; j &lt; count; ++j)
+                    candidate(j);
+            } else {
+<span class="hl">                for (unsigned int j = sub; j &lt; count; j += 1u &lt;&lt; shift)</span>
+                    candidate(j);
+            }
+...
+    for (unsigned int step = 1; step &lt; share; step &lt;&lt;= 1) {
+        #pragma unroll
+        for (int e = 0; e &lt; N; ++e)
+<span class="hl">            values[e] += __shfl_xor_sync(0xffffffffu, values[e], step);</span>
+    }</code></pre>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th class="l">Case (C = 16)</th><th class="num">forward</th><th class="num">backward</th><th class="num">density</th><th class="num">forward instructions</th><th class="num">active lanes, fwd / bwd</th></tr></thead>
+  <tbody>
+    <tr><td class="l">Dense disk, 2D clamped</td><td class="num">350 → 332 µs</td><td class="num">351 → 352 µs</td><td class="num">103 → 104 µs</td><td class="num">−3%</td><td class="num">18.5 → 19.1 / 20.4 → 21.0</td></tr>
+    <tr><td class="l">Uniform, 2D periodic</td><td class="num">107 → 104 µs</td><td class="num">105 → 90 µs</td><td class="num">34 → 30 µs</td><td class="num">−16%</td><td class="num">15.7 → 19.1 / 17.7 → 21.1</td></tr>
+    <tr><td class="l">Shape, 2D clamped</td><td class="num">93 → 79 µs</td><td class="num">72 → 71 µs</td><td class="num">22 → 20 µs</td><td class="num">−18%</td><td class="num">15.6 → 20.0 / 17.2 → 21.6</td></tr>
+    <tr><td class="l">Ball seed, 3D clamped</td><td class="num">396 → 360 µs</td><td class="num">259 → 214 µs</td><td class="num">113 → 107 µs</td><td class="num">−11%</td><td class="num">16.2 → 22.2 / 17.1 → 23.5</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="table-note">Nsight Compute at locked base clocks, medians of three (before) and four (after) profiled calls per build, step 10 → step 11. Active lanes: average active threads per executed warp instruction, out of 32. The shape backward varies by ±5% between profiled calls; its instruction count fell 17%. Per call at normal clocks (sum of all kernels of one <code>fused_perception</code> call, medians of two interleaved rounds): forward −5 to −13%, backward −5 to −30%, the largest in 3D (476 → 412 µs forward, 284 → 200 µs backward). Training time did not move (fox 19.87 s, bubbly 14.26 s; the step is host-launch bound, step 9). Details in BENCHMARKS.md, "Third optimization round".</p>
+
+<p>Does the gain depend on the particle count? The same kernels on the same grids with 2,048 to 32,768 particles per sample (so the particles per cell grow with <span class="math">N</span>), and the 3D ball with 4,096 to 65,536:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th class="l">Case</th><th class="num">N</th><th class="num">forward</th><th class="num"></th><th class="num">backward</th><th class="num"></th><th class="num">density</th><th class="num"></th></tr></thead>
+  <tbody>
+    <tr><td class="l">Dense disk, 2D</td><td class="num">2,048</td><td class="num">130.5 → 128.0 µs</td><td class="num">−2%</td><td class="num">131.6 → 130.8 µs</td><td class="num">−1%</td><td class="num">36.8 → 36.3 µs</td><td class="num">−1%</td></tr>
+    <tr><td class="l">Dense disk, 2D</td><td class="num">4,096</td><td class="num">353.6 → 334.7 µs</td><td class="num">−5%</td><td class="num">363.8 → 351.4 µs</td><td class="num">−3%</td><td class="num">104.2 → 102.0 µs</td><td class="num">−2%</td></tr>
+    <tr><td class="l">Dense disk, 2D</td><td class="num">8,192</td><td class="num">1,156 → 1,099 µs</td><td class="num">−5%</td><td class="num">1,112 → 1,110 µs</td><td class="num">0%</td><td class="num">300.6 → 302.0 µs</td><td class="num">0%</td></tr>
+    <tr><td class="l">Dense disk, 2D</td><td class="num">16,384</td><td class="num">4,248 → 4,021 µs</td><td class="num">−5%</td><td class="num">3,880 → 3,975 µs</td><td class="num">+2%</td><td class="num">970.9 → 974.6 µs</td><td class="num">0%</td></tr>
+    <tr><td class="l">Dense disk, 2D</td><td class="num">32,768</td><td class="num">16,242 → 15,451 µs</td><td class="num">−5%</td><td class="num">14,722 → 15,049 µs</td><td class="num">+2%</td><td class="num">3,571 → 3,527 µs</td><td class="num">−1%</td></tr>
+    <tr><td class="l">Uniform, 2D periodic</td><td class="num">2,048</td><td class="num">46.8 → 44.2 µs</td><td class="num">−6%</td><td class="num">34.0 → 33.6 µs</td><td class="num">−1%</td><td class="num">15.4 → 14.6 µs</td><td class="num">−6%</td></tr>
+    <tr><td class="l">Uniform, 2D periodic</td><td class="num">4,096</td><td class="num">111.9 → 106.2 µs</td><td class="num">−5%</td><td class="num">106.5 → 94.0 µs</td><td class="num">−12%</td><td class="num">31.6 → 29.6 µs</td><td class="num">−6%</td></tr>
+    <tr><td class="l">Uniform, 2D periodic</td><td class="num">8,192</td><td class="num">299.7 → 291.9 µs</td><td class="num">−3%</td><td class="num">255.6 → 241.6 µs</td><td class="num">−5%</td><td class="num">86.9 → 85.9 µs</td><td class="num">−1%</td></tr>
+    <tr><td class="l">Uniform, 2D periodic</td><td class="num">16,384</td><td class="num">988.9 → 967.8 µs</td><td class="num">−2%</td><td class="num">831.9 → 777.0 µs</td><td class="num">−7%</td><td class="num">261.5 → 258.7 µs</td><td class="num">−1%</td></tr>
+    <tr><td class="l">Uniform, 2D periodic</td><td class="num">32,768</td><td class="num">3,599 → 3,607 µs</td><td class="num">0%</td><td class="num">3,051 → 2,879 µs</td><td class="num">−6%</td><td class="num">920.9 → 919.2 µs</td><td class="num">0%</td></tr>
+    <tr><td class="l">Shape, 2D</td><td class="num">2,048</td><td class="num">43.5 → 36.5 µs</td><td class="num">−16%</td><td class="num">29.3 → 25.0 µs</td><td class="num">−15%</td><td class="num">10.8 → 10.2 µs</td><td class="num">−6%</td></tr>
+    <tr><td class="l">Shape, 2D</td><td class="num">4,096</td><td class="num">89.3 → 77.4 µs</td><td class="num">−13%</td><td class="num">69.0 → 67.1 µs</td><td class="num">−3%</td><td class="num">21.5 → 19.6 µs</td><td class="num">−9%</td></tr>
+    <tr><td class="l">Shape, 2D</td><td class="num">8,192</td><td class="num">206.2 → 189.2 µs</td><td class="num">−8%</td><td class="num">175.0 → 167.5 µs</td><td class="num">−4%</td><td class="num">52.1 → 50.5 µs</td><td class="num">−3%</td></tr>
+    <tr><td class="l">Shape, 2D</td><td class="num">16,384</td><td class="num">643.8 → 577.0 µs</td><td class="num">−10%</td><td class="num">555.8 → 537.4 µs</td><td class="num">−3%</td><td class="num">151.3 → 145.0 µs</td><td class="num">−4%</td></tr>
+    <tr><td class="l">Shape, 2D</td><td class="num">32,768</td><td class="num">2,243 → 2,092 µs</td><td class="num">−7%</td><td class="num">1,929 → 1,924 µs</td><td class="num">0%</td><td class="num">490.3 → 481.0 µs</td><td class="num">−2%</td></tr>
+    <tr><td class="l">Texture, 2D periodic</td><td class="num">2,048</td><td class="num">48.6 → 45.5 µs</td><td class="num">−7%</td><td class="num">46.0 → 33.8 µs</td><td class="num">−27%</td><td class="num">16.5 → 15.1 µs</td><td class="num">−9%</td></tr>
+    <tr><td class="l">Texture, 2D periodic</td><td class="num">4,096</td><td class="num">112.1 → 104.7 µs</td><td class="num">−7%</td><td class="num">103.8 → 89.9 µs</td><td class="num">−13%</td><td class="num">32.1 → 30.0 µs</td><td class="num">−7%</td></tr>
+    <tr><td class="l">Texture, 2D periodic</td><td class="num">8,192</td><td class="num">293.4 → 279.1 µs</td><td class="num">−5%</td><td class="num">258.8 → 231.7 µs</td><td class="num">−10%</td><td class="num">86.2 → 86.0 µs</td><td class="num">0%</td></tr>
+    <tr><td class="l">Texture, 2D periodic</td><td class="num">16,384</td><td class="num">937.1 → 912.1 µs</td><td class="num">−3%</td><td class="num">808.4 → 740.5 µs</td><td class="num">−8%</td><td class="num">259.3 → 253.6 µs</td><td class="num">−2%</td></tr>
+    <tr><td class="l">Texture, 2D periodic</td><td class="num">32,768</td><td class="num">3,363 → 3,314 µs</td><td class="num">−1%</td><td class="num">2,853 → 2,660 µs</td><td class="num">−7%</td><td class="num">884.0 → 884.0 µs</td><td class="num">0%</td></tr>
+    <tr><td class="l">Ball seed, 3D</td><td class="num">4,096</td><td class="num">166.6 → 175.7 µs</td><td class="num">+5%</td><td class="num">96.9 → 99.2 µs</td><td class="num">+2%</td><td class="num">57.0 → 60.0 µs</td><td class="num">+5%</td></tr>
+    <tr><td class="l">Ball seed, 3D</td><td class="num">8,192</td><td class="num">256.1 → 261.9 µs</td><td class="num">+2%</td><td class="num">155.4 → 148.3 µs</td><td class="num">−5%</td><td class="num">82.2 → 87.3 µs</td><td class="num">+6%</td></tr>
+    <tr><td class="l">Ball seed, 3D</td><td class="num">16,384</td><td class="num">385.6 → 349.9 µs</td><td class="num">−9%</td><td class="num">257.8 → 212.3 µs</td><td class="num">−18%</td><td class="num">110.7 → 107.6 µs</td><td class="num">−3%</td></tr>
+    <tr><td class="l">Ball seed, 3D</td><td class="num">32,768</td><td class="num">606.1 → 481.5 µs</td><td class="num">−21%</td><td class="num">459.0 → 347.7 µs</td><td class="num">−24%</td><td class="num">153.6 → 136.8 µs</td><td class="num">−11%</td></tr>
+    <tr><td class="l">Ball seed, 3D</td><td class="num">65,536</td><td class="num">1,090 → 975.3 µs</td><td class="num">−10%</td><td class="num">851.3 → 724.6 µs</td><td class="num">−15%</td><td class="num">250.6 → 243.8 µs</td><td class="num">−3%</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="table-note">Nsight Compute at locked base clocks, medians of three calls, step 10 → step 11, C = 16, B = 8 in 2D and 4 in 3D. The gains shrink as the cells fill up: at N = 32,768 on a 16 × 16 grid almost every block holds 32 particles and shares nothing. In 3D the ball keeps its radius, so N sets the particles per cell: about 1 at 4,096, 13 at 16,384 (the configured case), 50 at 65,536. The two smallest 3D counts are where the cap matters: with lanes shared by the particle count alone the 3D forward was 21% and 13% slower there (a tile holds about three candidates, and the butterfly has nothing to split); with the cap it is 5% and 2% slower, the fixed cost of the sharing machinery in blocks with almost no work.</p>
+
+<p>The durations fall less than the instruction counts because the sparse kernels wait more than they issue: the per-pass work (tile copies, barriers, the team reduction, the epilogue) is the same whether a particle has one lane or eight, and the periodic uniform forward is dominated by it. Four variants were measured and dropped. Summing the span lengths inside the neighbor kernels instead of in the record kernel (every warp walks the nine spans of its block before the pass loop) cost as much in 3D as the regression it removed; using the cell's own particle count as the density (free) fixed 3D but capped the boundary blocks of the dense disk, whose cells are nearly empty while their neighbor rows are full, and lost half of the dense gain. Contiguous candidate ranges per lane (lane <span class="math">r</span> takes candidates <span class="math">r · chunk</span> to <span class="math">(r + 1) · chunk − 1</span>) keep the stride-1 loop but make the lanes of one particle read tile rows that are a multiple of 32 banks apart: three times the bank conflicts and a slower backward. Padding the staged rows to an odd number of <code>float4</code> removes even the conflicts of the interleaved version (3D backward: 7.6 million to 31 thousand), but no kernel got faster and the larger tiles cost occupancy; the conflicts were not on the critical path.</p>
 
 <h2 id="results"><span class="eyebrow">Summary</span>Results</h2>
 
@@ -1996,6 +2133,7 @@ rgb.scatter_add_(0, flat_idx.expand(-1, 3), c.reshape(-1, 3))</code></pre>
     <tr><td class="l"><code>sphops/FUSED_PERCEPTION.md</code></td><td class="l">API and design notes, tuning knobs</td></tr>
     <tr><td class="l"><code>sphops/BENCHMARKS.md</code></td><td class="l">commands and all result tables</td></tr>
     <tr><td class="l"><code>sphops/ncu_reports/fused_vs_unfused_20261008/</code></td><td class="l">the six Nsight Compute reports used in this guide</td></tr>
+    <tr><td class="l"><code>sphops/ncu_reports/fused_round2_20261008/</code></td><td class="l">full reports of the current kernels (dense disk and shape, forward and backward), regenerated after step 11</td></tr>
   </tbody>
 </table>
 </div>

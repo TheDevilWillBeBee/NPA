@@ -22,6 +22,8 @@ if _extension_path:
         raise ImportError("Changing the SPH extension requires a fresh Python process")
 else:
     from sphops import sph_cuda
+# Words per block record (BlockInfo in utils.cuh); older extensions have 4.
+BLOCK_INFO_WORDS = getattr(sph_cuda, "BLOCK_INFO_WORDS", 4)
 
 
 def _default_mass(x, mass):
@@ -105,7 +107,7 @@ class HashGrid:
             B * self.num_cells + 1, dtype=torch.int32, device=self.device
         )
         block_info = torch.empty(
-            self.hashgrid.max_blocks, 4, dtype=torch.int32, device=self.device
+            self.hashgrid.max_blocks, BLOCK_INFO_WORDS, dtype=torch.int32, device=self.device
         )
 
         self.hashgrid.initialize(x, permutation, bin_offsets, block_info)
@@ -631,11 +633,11 @@ def fused_perception(x, s, grid, eps0, *, mass=None, perceive_state=True, densit
         z = torch.cat(parts, dim=-1)
         s_bin = s_bin[..., :channels]
     B, N = x.shape[:2]
-    blocks = grid.hashgrid.max_blocks * 4
+    blocks = grid.hashgrid.max_blocks * BLOCK_INFO_WORDS
     offsets = blocks + B * grid.num_cells + 1
     snapshot = HashGridSnapshot(
         grid=grid.hashgrid, bin_offsets=buffer[blocks:offsets], permutation=buffer[offsets:].view(B, N),
-        block_info=buffer[:blocks].view(-1, 4), dim=grid.dim,
+        block_info=buffer[:blocks].view(-1, BLOCK_INFO_WORDS), dim=grid.dim,
     )
     return z, x_bin, s_bin, snapshot
 

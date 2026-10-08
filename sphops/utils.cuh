@@ -190,11 +190,15 @@ static_assert(sizeof(ParticlePosition<3>) == 3 * sizeof(float), "3D positions mu
 // Add these member variables to the HashGrid class
 struct BlockInfo
 {
-    uint32_t cell_idx;       // Which cell this block belongs to
-    uint32_t offset_in_cell; // Starting particle offset within the cell
-    uint32_t particle_count; // Number of particles this block handles (up to 256)
-    uint32_t batch_idx;      // Which batch this block belongs to
+    uint32_t cell_idx;           // Which cell this block belongs to
+    uint32_t offset_in_cell;     // Starting particle offset within the cell
+    uint32_t particle_count;     // Number of particles this block handles (up to 256)
+    uint32_t batch_idx;          // Which batch this block belongs to
+    uint32_t candidates_per_row; // Average neighbor candidates per row span of the cell (fused lane sharing)
+    uint32_t reserved[3];        // Keeps the record at two 16-byte words
 };
+static_assert(sizeof(BlockInfo) == 32, "BlockInfo is two 16-byte words");
+constexpr int BLOCK_INFO_WORDS = sizeof(BlockInfo) / sizeof(uint32_t);
 
 // In-place inverse of a symmetric DIM x DIM matrix (row-major, full storage).
 // Near-singular matrices (|det| < tolerance) become the identity: isolated or
