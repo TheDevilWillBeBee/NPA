@@ -1,50 +1,108 @@
 # Fused SPH perception
 
-NPA enables `fused_perception=True` by default. Setting it to `False` selects
-the original SPH operators. The Python dispatcher automatically falls back for
-workloads outside the fused implementation's supported configuration; rebuild
-the CUDA extension to make the new kernels available. Checkpoint keys and MLP
-dimensions are unchanged.
+NPA enables `fused_perception=True` by default: `NPA.perceive` then builds the
+hash grid, bins particles, and computes the perception features with fused
+CUDA kernels (`sphops.fused_perception`). Setting it to `False`, or a workload
+outside the supported configuration, selects the standalone SPH operators
+(`grid.instantiate`, `sphops.bin_particles`, `sphops.perception`). Rebuild the
+CUDA extension to make the fused kernels available; an extension without them
+uses the standalone operators. Checkpoint keys and MLP dimensions are unchanged.
+
+## Python API
+
+```python
+z, x_bin, s_bin, snapshot = sphops.fused_perception(
+    x, s, grid, eps0, mass=None, perceive_state=True, density_grad=True,
+    log_norm_grad=True, log_norm_density_grad=True)
+```
+
+`x`, `s`, and `mass` are in the original particle order, and `grid` is a
+`sphops.HashGrid`. The result equals, up to float32 summation order:
+
+```python
+snapshot = grid.instantiate(x)
+x_bin, s_bin = sphops.bin_particles(x, s, snapshot)
+z = sphops.perception(x_bin.detach(), s_bin, snapshot, eps0)  # s_bin.detach() if not perceive_state
+```
+
+The `FusedPerception` autograd function makes one native call per direction.
+Forward runs grid construction, binning, density, and features on the current
+stream, keeping the snapshot in one int32 buffer and the state saved for
+backward in one float workspace. Backward computes the perception adjoint and
+adds the binned-state cotangent while unbinning, which is the sum autograd
+would form for the two uses of `s_bin`. Positions receive gradients through
+binning only. The returned `snapshot` is a regular `HashGridSnapshot`, so it
+works with `bin_particles`, `unbin_particles`, and the standalone operators.
+Compared with separate grid, binning, and perception calls, this saves about
+125 us of host time per training step forward and 200 us forward+backward
+on the test machine.
+`sphops.fused_perception_supported(x, s, grid, mass)` reports whether inputs
+are supported.
+
+`sphops.perception(x_bin, s_bin, snapshot, eps0, ...)` composes the standalone
+operators on binned particles. It is also differentiable with respect to
+positions; NPA uses it when `stopgrad_pos=False`.
 
 ## Supported configurations
 
-The fused path supports CUDA float32, contiguous particle positions/states,
-2D or 3D, grid mode, clamped or periodic boundaries, and logical state-channel
-counts 1–32. Perception positions must be detached (`stopgrad_pos=True`, the
-NPA default), and state-gradient perception must be enabled. The kernel has a
-state-only backward: it does not differentiate positions, density, or masses.
-Other modes, C > 32, position gradients, and disabled state-gradient perception
-use the original operations, subject to those operators' normal requirements.
+The fused path supports CUDA float32 positions and states, 2D or 3D, grid
+mode, clamped or periodic boundaries, and 1-32 state channels. NPA uses it
+when perception positions are detached (`stopgrad_pos=True`, the default) and
+state-gradient perception is enabled. The kernels have a state-only backward:
+they do not differentiate positions, density, or masses. Other modes, more
+than 32 channels, position gradients, and disabled state-gradient perception
+use the standalone operators, subject to their normal requirements.
 
-Native CUDA channel counts are 4, 8, 16, and 32. PyTorch zero-pads other counts
-to the next native size, slices each output field separately, and repacks the
-original logical width. Padding/unpacking are differentiable; the model never
-changes its state or MLP dimensions. Native counts avoid this overhead. Padding
-can reduce the performance benefit, particularly for 17–31 channels padded to
-32; use the opt-out when measurements favor the original operators.
+The kernels are specialized for 4, 8, 16, and 32 channels. Other counts are
+zero-padded to the next native size; each output field is sliced separately
+and repacked to the logical width, and `s_bin` is returned as a view of the
+padded binned state. Padding is differentiable, and the model never changes
+its state or MLP dimensions. Native counts avoid this overhead. Padding can
+reduce the performance benefit, particularly for 17-31 channels padded to 32.
 
 3D positions use the existing `[B,N,4]` padded storage layout, but perception
 gradient features have three spatial components.
 
 ## Fixed particle masses
 
-Supply `mass=` to `NPA.forward` or `NPA.perceive` in the same original particle
-order as the input positions/states. `sphops.perception` accepts masses in
-snapshot-binned order. Both APIs accept `[B,N]` or `[B,N,1]` tensors; masses must
-match the positions' device/dtype and must not require gradients. Use finite,
-positive masses. Omitted masses become ones, using the same mass-aware kernels,
-not a separate unit-mass specialization.
+Supply `mass=` to `NPA.forward`, `NPA.perceive`, or `fused_perception` in the
+same original particle order as the input positions/states. `sphops.perception`
+accepts masses in snapshot-binned order. All accept `[B,N]` or `[B,N,1]`
+tensors; masses must match the positions' device/dtype and must not require
+gradients. Use finite, positive masses. Omitted masses are ones; the fused path
+reads a persistent ones buffer with the same mass-aware kernels instead of
+allocating and binning one every step.
 
 The density stage computes `rho_i = sum_j mass_j * W_ij` and caches
 `volume_i = mass_i / rho_i`. Subsequent forward/state-backward stages use those
-volumes. Density-gradient features retain the original division by particle
-count N, not total mass.
+volumes. The density-gradient feature is divided by each sample's total mass
+(N for unit masses), so it does not depend on the number of particles or on a
+uniform rescaling of the masses. With explicit masses, the fused forward sums
+them per sample in the original particle order (a fixed-order block reduction,
+independent of the atomic binning order).
 
 Rollout helpers return binned positions and states, whose particle order can
 change at every step. `step_euler` does not accept masses: callers making
 custom nonuniform-mass rollouts must pass `mass=` to the model and permute those
 masses into the returned order before the next step. Reusing the original mass
 array with already-binned positions would attach masses to the wrong particles.
+
+## Optional compiled NPA step
+
+`NPA(compile_step=True)` is an opt-in runtime optimization for `step_euler`:
+PyTorch compiles the adaptation MLP, displacement normalization/statistics,
+update-mask comparison, and Euler updates together. Native grid/perception and
+random-number generation remain outside compilation. Random draws therefore
+consume the same CUDA RNG sequence as the eager path. Checkpoint keys and
+logical state dimensions are unchanged. Standalone `NPA.forward` and
+`step_euler_trace` continue to use the eager adaptation path.
+
+Compilation uses fixed shapes, default Inductor mode (no max-autotune sweep),
+and no CUDA graph capture.
+Keep batch/particle/channel counts and update settings stable to avoid
+recompilation. It is disabled by default: warmup and additional saved tensors
+can outweigh gains for short runs or memory-constrained workloads. See
+[BENCHMARKS.md](BENCHMARKS.md) for the benchmark options.
 
 ## CUDA implementation
 
@@ -53,10 +111,30 @@ four stages; this is a fused perception pipeline, not one monolithic kernel.
 
 | Stage | Work | Scheduling |
 | --- | --- | --- |
-| `density_forward` | Mass-weighted density, optional density gradient, cached volumes | One cooperating warp per particle |
-| `forward` | Blur, raw state gradient, moment correction, scaling/log normalization, output packing | One FEATURES-wide subwarp per particle; shared neighbor tiles |
+| `density_forward` | Mass-weighted density, optional density gradient, cached volumes | Lane per particle; neighbor-tile warp teams |
+| `forward` | Blur, raw state gradient, moment correction, scaling/log normalization, output packing | Lane per particle (two channel-group warps for 32 channels); neighbor-tile warp teams |
 | `backward_prepare` | Normalization adjoint, radius scaling, direct/self state contribution, cotangent layout conversion | One thread per particle/channel |
-| `backward` | Combined blur/raw-gradient neighbor adjoints | Subwarp per particle; shared cotangent tiles; no global atomics |
+| `backward` | Combined blur/raw-gradient neighbor adjoints | Lane per particle; neighbor-tile warp teams; no global atomics |
+
+A grid block holds at most `max_particles_per_block` particles of one cell, so
+all of its particles share one neighbor-candidate sequence: three merged-x row
+spans in 2D, nine in 3D, plus a disjoint wrap chunk at periodic seams. Each
+lane owns one particle. A neighbor's position, volume, and state (or
+cotangents) are therefore warp-broadcast `float4` shared-memory reads with no
+shuffles, pair geometry and moment terms are computed once per pair, and
+candidates outside the kernel support are skipped. 32 channels use two warps of
+16 channels each to bound registers. Grid blocks larger than 32 particles are
+processed in passes of 32.
+
+One lane per particle alone leaves too few warps to hide latency (B=8, N=4096
+is about 1,024 warps). Each grid block therefore runs `NEIGHBOR_WARPS` warp
+teams. Each team takes every `NEIGHBOR_WARPS`-th neighbor tile into a
+warp-private shared buffer (only `__syncwarp` in the neighbor loop). Their
+per-lane partial sums are reduced in fixed team order through shared memory
+that aliases the tiles. Results are deterministic, but the summation order
+differs from one sequential sweep. Setting `NEIGHBOR_WARPS = 1` restores
+the per-particle sequential order of the previous fused forward/backward
+kernels (bitwise identical in 2D in our A/B checks).
 
 The packed output is `[state(C), blur(C), state_gradient(C*D), density_gradient(D)]`;
 the last field is omitted when disabled. Kernels use saved snapshot bin offsets
@@ -82,46 +160,42 @@ change the state adjoint near zero.
 
 The Python autograd context retains positions, volumes, normalization values,
 weighted gradient sums, radius, and the snapshot. It need not save masses,
-states, or moment matrices for backward. Shared-memory barriers must remain
-block-uniform: invalid local-particle groups still participate in tile loads,
-shuffles, and barriers.
+states, or moment matrices for backward. Barriers must remain block-uniform:
+lanes without a particle still load tiles and reach every `__syncwarp` and
+team-reduction `__syncthreads`, but skip pair work.
+
+The extension is built without CUDA separable compilation (one translation
+unit, no device-side launches). Relocatable device code made ptxas spill in
+these kernels. Grid construction (`initialize`) keeps each particle's
+arrival rank from the counting pass instead of running a second atomic pass,
+clears only its counters and block-info sentinels (other outputs are fully
+written), and orders all work on the caller's stream. Particle order within a
+cell remains arbitrary, as before.
+
+The grid classes expose the fused path as `fused_perception_forward`,
+`fused_perception_backward`, `fused_workspace_size`, and `fused_snapshot_words`
+(`sph_cuda.cu`); `fused_workspace_layout` defines the saved-state layout.
 
 The accompanying standalone-kernel fixes allocate/initialize CUB scan sentinels,
 use snapshot-owned block bounds during later backward passes, and synchronize
-shared gradient-buffer reads before reuse. Package/standalone Python imports
-reuse one native extension instance to avoid duplicate nanobind registration.
+shared gradient-buffer reads before reuse.
 
-## Low-risk tuning candidates
+## Tuning knobs
 
-No new tuning values were enabled during the documentation/default cleanup.
-The named constants in `perception.cuh` currently retain the measured settings:
+The named constants in `perception.cuh` hold the measured settings:
 
-| Knob | Current | Initial sweep | Important tradeoff |
+| Knob | Current | Swept | Notes |
 | --- | ---: | --- | --- |
-| `BLOCK_THREADS` | 256 | 128, 256, 512 | Local particles per tile = threads / native FEATURES; larger blocks reuse tiles across more particles but can limit occupancy |
-| `NEIGHBOR_TILE` | 64 | 32, 64 | Fewer barriers versus shared-memory footprint; 128 is only a candidate for smaller C |
-| `DENSITY_THREADS` | 128 | 64, 128, 256 | Cooperating warps per grid block; full warps are required |
-| `BACKWARD_PREPARE_THREADS` | 256 | 128, 256, 512 | Simple pointwise kernel; likely a smaller overall gain |
-| `max_particles_per_block` | 32 in training configs | 16, 32, 64 | More/smaller grid blocks versus reuse and idle groups; also affects grid instantiation |
+| `NEIGHBOR_WARPS` | 4 | 1, 2, 3, 4, 6 | Warp teams per grid block. 3-4 were best; 6 exceeds 48 KiB static shared memory for 3D C=32 backward |
+| `FORWARD_RESIDENT_WARPS` | 16 | 16, 20 | `__launch_bounds__` register target; 20 spilled in the C=16 forward |
+| `BACKWARD_RESIDENT_WARPS` | 32 | - | Backward needs at most 64 registers |
+| `DENSITY_RESIDENT_WARPS` | 32 | - | Density needs at most 55 registers |
+| `NEIGHBOR_TILE` | 32 | - | One candidate per lane for loads; halved when a warp's tile exceeds `TILE_BYTES_PER_WARP` |
+| `TILE_BYTES_PER_WARP` | 6144 | - | Bounds shared memory per resident block (e.g. 2D C=16 backward uses 16-candidate tiles) |
+| `MAX_CHANNELS_PER_THREAD` | 16 | - | 32 channels split across two warps |
+| `max_particles_per_block` | 32 in configs | 16, 32, 64 | 16 leaves half of each lane-per-particle warp idle; prefer 32 or 64 |
 
-Prefer per-channel/per-pass choices over changing one global value for every
-workload. With C=4 and a grid capacity of 32, the current 256-thread feature
-kernel has 64 local groups, so half are inactive. At C=16/32, larger blocks can
-instead reduce the number of repeated neighbor-tile traversals. These are
-testable hypotheses, not measured speedups.
-
-Backward shared storage is approximately
-`NEIGHBOR_TILE * (sizeof(ParticlePosition<D>) + 4*(D+1)*C)` bytes. At C=32,
-a tile of 128 needs 50,176 bytes in 2D or 67,584 bytes in 3D, exceeding the usual
-48 KiB static shared-memory limit; do not blindly increase the tile for all
-specializations. Forward and backward may benefit from different tile sizes.
-
-A small code-level candidate is skipping feature arithmetic after broadcasting
-zero support weights: currently out-of-radius candidate pairs still do channel
-loads and multiply-adds. Measure the branch/divergence cost on both dense seeds
-and sparse targets, and preserve uniform barrier/shuffle participation.
-
-Use the validation/corpus/training workflows in [BENCHMARKS.md](BENCHMARKS.md)
-before selecting defaults. Every sweep should include forward and backward,
-dense disk seeds, uniform texture seeds, and multiple image targets; then confirm
-the winner with complete training and CUDA instrumentation.
+Re-tune with the corpus workflow in [BENCHMARKS.md](BENCHMARKS.md): every sweep
+should include forward and backward, dense disk seeds, uniform texture seeds,
+and multiple image targets, then confirm with complete training and CUDA
+instrumentation (including racecheck).

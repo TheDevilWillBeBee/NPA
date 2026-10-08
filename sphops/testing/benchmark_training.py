@@ -19,7 +19,7 @@ import yaml
 from losses import Loss
 from models.npa import NPA, Pool, step_euler
 from sphops import HashGrid
-from sphops.benchmark import GPUQuietGuard, fused_perception_context
+from sphops.testing.benchmark import GPUQuietGuard, fused_perception_context
 from train import fix_seed, get_optimizer, get_target
 
 
@@ -119,6 +119,8 @@ def run(args):
     cfg = yaml.safe_load(Path(args.config).read_text())
     cfg["npa"]["graft_path"] = str(Path(args.graft).resolve())
     cfg["npa"]["kwargs"]["fused_perception"] = args.variant == "fused"
+    if args.compile_step:
+        cfg["npa"]["kwargs"]["compile_step"] = True
     cfg["train"]["epochs"] = args.epochs
     cfg["train"]["num_repetitions"] = 1
     cfg["train"]["target"]["path"] = str(Path(args.target).resolve())
@@ -155,7 +157,17 @@ def run(args):
                 raise RuntimeError(f"Perception dispatch mismatch for {args.variant}")
             verified.append(active)
 
-        handle = model.model[0].register_forward_pre_hook(verify_path)
+        # Validate native dispatch before compiling. A Python grad_fn traversal
+        # inside a Linear hook cannot belong to the tensor-only compiled graph.
+        if model.compile_step:
+            sample_x = pool.pool_x[:cfg["train"]["batch_size"]]
+            sample_s = pool.pool_s[:cfg["train"]["batch_size"]].detach().requires_grad_()
+            probe, *_ = model.perceive(sample_x, sample_s, grid)
+            verify_path(None, (probe,))
+            del probe, sample_x, sample_s
+            handle = None
+        else:
+            handle = model.model[0].register_forward_pre_hook(verify_path)
         warmup_started = time.perf_counter()
         for epoch in range(args.warmup_epochs):
             row = run_epoch(epoch, cfg, model, pool, optimizer, scheduler, grid, loss_fn)
@@ -163,9 +175,14 @@ def run(args):
                   f"loss={row['loss']:.6f}, update={row['wall_seconds']:.3f}s", flush=True)
             guard.check()
         warmup_seconds = time.perf_counter() - warmup_started
-        handle.remove()
+        if handle is not None:
+            handle.remove()
         if not verified:
             raise RuntimeError("Warmup did not validate the perception dispatch")
+        # The callable captures this module's parameter identities. Warm the
+        # same module used for timing, then restore it rather than recompiling
+        # an independently constructed model inside the timed interval.
+        compiled_model = model if model.compile_step else None
         del model, pool, optimizer, scheduler
         # TextureLoss has a VGG network outside the NPA optimizer. Discard its
         # warmup gradients too, without freezing it or changing train.main's
@@ -176,6 +193,10 @@ def run(args):
         gc.collect()
         # Start both real runs from the graft and an identically seeded fresh pool.
         model, pool, optimizer, scheduler = create_state(cfg, checkpoint, device)
+        if compiled_model is not None:
+            compiled_model.load_state_dict(model.state_dict(), strict=True)
+            model = compiled_model
+            optimizer, scheduler = get_optimizer(model, cfg["train"])
         metadata = {
             "variant": args.variant, "epochs": args.epochs, "config": cfg,
             "initial_model_sha256": tensor_hash(model.state_dict()),
@@ -186,6 +207,7 @@ def run(args):
             "extension_path": str(extension_path),
             "extension_sha256": hashlib.sha256(extension_path.read_bytes()).hexdigest(),
             "warmup_epochs": args.warmup_epochs, "warmup_seconds": warmup_seconds,
+            "compile_step": model.compile_step,
             "dispatch_verified": True, "gpu_before": guard.telemetry(),
             "excluded": ["startup", "warmup", "rendering", "stability_evaluation", "checkpoint_io"],
             "phase_timing_note": "CUDA stream elapsed includes host launch gaps; not GPU-active time",
@@ -259,6 +281,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--block-cap", type=int)
+    parser.add_argument("--compile-step", action="store_true",
+                        help="Opt-in NPA(compile_step=True): compile the MLP and Euler update")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     if args.epochs < 1 or args.warmup_epochs < 1:

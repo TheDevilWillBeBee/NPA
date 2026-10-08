@@ -25,14 +25,16 @@ cd sphops
 ./build.ps1     # Windows
 ```
 
-The code has been tested across multiple CUDA and PyTorch versions. For best results we recommend **CUDA 13.0** and **PyTorch 2.12**. After building, run the test suite to verify the kernels compiled correctly and pass the numerical correctness tests:
+The code has been tested across multiple CUDA and PyTorch versions. For best results we recommend **CUDA 13.0** and **PyTorch 2.12**. After building, run the test suites from the repository root to verify the kernels compiled correctly and pass the numerical correctness tests:
 
 ```bash
-python3 test.py
+cd ..
+python3 -m sphops.testing.test                   # standalone SPH operators
+python3 -m sphops.testing.test_perception --gpu  # fused perception
 ```
 
 NPA uses fused SPH perception by default for supported CUDA grid workloads, with
-automatic fallback to the original operations. Set `fused_perception=False` to
+automatic fallback to the standalone SPH operators. Set `fused_perception=False` to
 opt out; see [fused perception](sphops/FUSED_PERCEPTION.md) for details and
 [benchmarking](sphops/BENCHMARKS.md) for validation and performance results.
 

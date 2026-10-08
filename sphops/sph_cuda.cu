@@ -1,5 +1,6 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/optional.h>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 #include <stdexcept>
@@ -30,11 +31,15 @@ using BlockInfoArray = nb::ndarray<int32_t, nb::shape<-1, 4>, nb::c_contig, nb::
         }                                                                             \
     } while (0)
 
+// Counting pass of the counting sort. Each particle's arrival rank within its
+// cell is kept in the permutation buffer, so the scatter pass needs no second
+// set of atomics (the order within a cell is arbitrary in either case).
 template <int DIM, BoundaryCondition BC, KernelStrategy ST>
 __global__ void grid_count_particles(
     const ParticlePosition<DIM> * __restrict__ positions,
     uint32_t * __restrict__ cell_counts,
     uint32_t * __restrict__ blocks_per_cell,
+    uint32_t * __restrict__ rank_in_cell,
     GridConfig<DIM, BC, ST> config)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -53,16 +58,18 @@ __global__ void grid_count_particles(
     uint32_t cell_idx = batch_idx * config.cell_count + hash;
 
     uint32_t prev_count = atomicAdd(&cell_counts[cell_idx], 1U);
+    rank_in_cell[idx] = prev_count;
     if constexpr (ST == KernelStrategy::GridBased)
         if (prev_count % config.MAX_PARTICLES_PER_BLOCK == 0)
             atomicAdd(&blocks_per_cell[cell_idx], 1U);
 }
 
+// Scatter pass: permutation[idx] holds the rank from grid_count_particles on
+// entry and the particle's binned index within its batch on exit.
 template <int DIM, BoundaryCondition BC, KernelStrategy ST>
 __global__ void grid_compute_permutation(
     const ParticlePosition<DIM> * __restrict__ positions,
     const uint32_t * __restrict__ bin_offsets,
-    uint32_t * __restrict__ bin_write_indices,
     uint32_t * __restrict__ permutation,
     GridConfig<DIM, BC, ST> config)
 {
@@ -79,9 +86,7 @@ __global__ void grid_compute_permutation(
     int cell[DIM];
     config.pos2cell(pos, cell);
     uint32_t hash = config.cell2hash(cell);
-    uint32_t write_idx = atomicAdd(&bin_write_indices[batch_idx * config.cell_count + hash], 1U);
-
-    permutation[idx] = write_idx + bin_offsets[batch_idx * config.cell_count + hash] - batch_idx * config.particle_count;
+    permutation[idx] += bin_offsets[batch_idx * config.cell_count + hash] - batch_idx * config.particle_count;
 }
 
 template <int DIM, BoundaryCondition BC, KernelStrategy ST>
@@ -106,7 +111,8 @@ __global__ void apply_permutation(
     uint32_t idx = batch_idx * config.particle_count + tid;
     uint32_t permuted_idx = permutation[idx] + batch_idx * config.particle_count;
     output_positions[permuted_idx] = input_positions[idx];
-    output_mass[permuted_idx] = input_mass[idx];
+    if (input_mass != nullptr)  // Optional: unit masses need no binning.
+        output_mass[permuted_idx] = input_mass[idx];
     uint32_t f = 0;
     // Vectorized float4 fast path when feature_dim is a multiple of 4
     if ((feature_dim & 3) == 0)
@@ -123,6 +129,9 @@ __global__ void apply_permutation(
     }
 }
 
+// Gather cotangents back to the original particle order. Position and mass
+// cotangents are optional (nullptr). An optional second binned state cotangent
+// is summed in the same pass, as autograd would accumulate the two.
 template <int DIM, BoundaryCondition BC, KernelStrategy ST>
 __global__ void backward_apply_permutation(
     const ParticlePosition<DIM> * __restrict__ grad_output_positions,
@@ -133,7 +142,8 @@ __global__ void backward_apply_permutation(
     float * __restrict__ grad_input_state,
     float * __restrict__ grad_input_mass,
     uint32_t feature_dim,
-    GridConfig<DIM, BC, ST> config)
+    GridConfig<DIM, BC, ST> config,
+    const float * __restrict__ grad_output_state_addend = nullptr)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t batch_idx = blockIdx.y;
@@ -147,23 +157,35 @@ __global__ void backward_apply_permutation(
     uint32_t permuted_idx = permutation[idx] + batch_idx * config.particle_count;
 
     // Backward pass for positions: grad_input_positions[idx] = grad_output_positions[permuted_idx]
-    grad_input_positions[idx] = grad_output_positions[permuted_idx];
-    grad_input_mass[idx] = grad_output_mass[permuted_idx];
+    if (grad_output_positions != nullptr)
+        grad_input_positions[idx] = grad_output_positions[permuted_idx];
+    if (grad_output_mass != nullptr)
+        grad_input_mass[idx] = grad_output_mass[permuted_idx];
 
     // Backward pass for state: grad_input_state[idx * feature_dim + f] = grad_output_state[permuted_idx * feature_dim + f]
+    if (grad_output_state == nullptr)
+        return;
     uint32_t f = 0;
-    // Vectorized float4 fast path when feature_dim is a multiple of 4
-    if ((feature_dim & 3) == 0)
+    const float *src = &grad_output_state[permuted_idx * feature_dim];
+    float *dst = &grad_input_state[idx * feature_dim];
+    if (grad_output_state_addend != nullptr)
     {
-        const float4 *src4 = reinterpret_cast<const float4 *>(&grad_output_state[permuted_idx * feature_dim]);
-        float4 *dst4 = reinterpret_cast<float4 *>(&grad_input_state[idx * feature_dim]);
+        const float *addend = &grad_output_state_addend[permuted_idx * feature_dim];
+        for (; f < feature_dim; ++f)
+            dst[f] = src[f] + addend[f];
+    }
+    // Vectorized float4 fast path when feature_dim is a multiple of 4
+    else if ((feature_dim & 3) == 0)
+    {
+        const float4 *src4 = reinterpret_cast<const float4 *>(src);
+        float4 *dst4 = reinterpret_cast<float4 *>(dst);
         for (; f < feature_dim; f += 4)
             dst4[f >> 2] = src4[f >> 2];
     }
     else
     {
         for (; f < feature_dim; ++f)
-            grad_input_state[idx * feature_dim + f] = grad_output_state[permuted_idx * feature_dim + f];
+            dst[f] = src[f];
     }
 }
 // Kernel to assign block information
@@ -1823,16 +1845,19 @@ class HashGrid
 protected:
     GridConfig<DIM, BC, ST> m_config;
 
-    uint32_t *m_cell_counts = nullptr;       // Device array of size (cell_count * batch_size)
-    uint32_t *m_bin_write_indices = nullptr; // Device array of size (cell_count * batch_size)
+    // One counter allocation, cleared by a single memset: cell counts (with a
+    // zero scan sentinel), then blocks per cell in grid mode.
+    uint32_t *m_cell_counts = nullptr;       // Device array of size (cell_count * batch_size + 1)
+    size_t m_counter_words = 0;
 
     // Pre-allocated temporary storage for CUB prefix sum
     void *m_temp_storage = nullptr;
     size_t m_temp_storage_bytes = 0;
 
     // BlockInfo *m_block_info = nullptr;     // Device array storing block information
-    uint32_t *m_blocks_per_cell = nullptr; // Device array storing blocks needed per cell (batch_size * cell_count)
+    uint32_t *m_blocks_per_cell = nullptr; // Part of m_cell_counts: blocks needed per cell (batch_size * cell_count + 1)
     uint32_t *m_block_offsets = nullptr;   // Device array for cumulative sum of blocks per cell (batch_size * cell_count + 1)
+    float *m_unit_mass = nullptr;          // Grid mode: batch_size * N ones for fused perception without masses
 
     uint32_t m_dimension;  // 2 for 2D, 4 for 3D (to align with float4)
     uint32_t m_max_blocks; // Number of blocks used in the last computation
@@ -1883,8 +1908,9 @@ protected:
 
         // Allocate cell counts array
         // Exclusive scans include a zero sentinel to produce the final total.
-        cuda_check(cudaMalloc(&m_cell_counts, sizeof(uint32_t) * (m_config.cell_count * batch_size + 1)));
-        cuda_check(cudaMalloc(&m_bin_write_indices, sizeof(uint32_t) * m_config.cell_count * batch_size));
+        size_t scan_words = m_config.cell_count * size_t(batch_size) + 1;
+        m_counter_words = ST == KernelStrategy::GridBased ? 2 * scan_words : scan_words;
+        cuda_check(cudaMalloc(&m_cell_counts, sizeof(uint32_t) * m_counter_words));
 
         // Determine temporary storage requirements for CUB prefix sum
         cub::DeviceScan::ExclusiveSum(
@@ -1895,9 +1921,13 @@ protected:
 
         if constexpr (ST == KernelStrategy::GridBased)
         {
-            // Allocate blocks per cell array
-            cuda_check(cudaMalloc(&m_blocks_per_cell, sizeof(uint32_t) * (m_config.cell_count * batch_size + 1)));
-            cuda_check(cudaMalloc(&m_block_offsets, sizeof(uint32_t) * (m_config.cell_count * batch_size + 1)));
+            m_blocks_per_cell = m_cell_counts + scan_words;
+            cuda_check(cudaMalloc(&m_block_offsets, sizeof(uint32_t) * scan_words));
+            // Omitted masses are ones; a persistent buffer avoids filling and
+            // binning one every step (binned ones are ones).
+            std::vector<float> ones(size_t(particle_count) * batch_size, 1.0f);
+            cuda_check(cudaMalloc(&m_unit_mass, sizeof(float) * ones.size()));
+            cuda_check(cudaMemcpy(m_unit_mass, ones.data(), sizeof(float) * ones.size(), cudaMemcpyHostToDevice));
         }
 
         m_dimension = (DIM == 2) ? 2U : 4U;
@@ -1906,15 +1936,14 @@ protected:
 public:
     ~HashGrid()
     {
-        cudaFree(m_cell_counts);
-        cudaFree(m_bin_write_indices);
+        cudaFree(m_cell_counts);  // Also holds m_blocks_per_cell.
         cudaFree(m_temp_storage);
 
         if constexpr (ST == KernelStrategy::GridBased)
-            cudaFree(m_blocks_per_cell);
-
-        if constexpr (ST == KernelStrategy::GridBased)
+        {
             cudaFree(m_block_offsets);
+            cudaFree(m_unit_mass);
+        }
     }
 
     float eps() const { return m_config.eps; }
@@ -1927,6 +1956,47 @@ public:
     int max_blocks() const { return m_max_blocks; }
 
     uint32_t max_particles_per_block() const { return m_config.MAX_PARTICLES_PER_BLOCK; }
+
+    // Counting sort of particles into cells plus grid-block assignment, ordered
+    // on `stream`. Every output entry is written, so only the counters and the
+    // block-info sentinels need clearing.
+    void initialize_impl(const ParticlePosition<DIM> *d_positions, uint32_t *d_permutation,
+                         uint32_t *d_bin_offsets, BlockInfo *d_block_info, cudaStream_t stream)
+    {
+        uint32_t scan_items = m_config.batch_size * m_config.cell_count + 1;
+        cuda_check(cudaMemsetAsync(m_cell_counts, 0, sizeof(uint32_t) * m_counter_words, stream));
+
+        dim3 block_dim(256, 1, 1);
+        dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
+        grid_count_particles<DIM, BC, ST><<<grid_dim, block_dim, 0, stream>>>(
+            d_positions, m_cell_counts, m_blocks_per_cell, d_permutation, m_config);
+        cuda_check(cudaGetLastError());
+
+        // Compute prefix sum to get bin offsets
+        cuda_check(cub::DeviceScan::ExclusiveSum(
+            m_temp_storage, m_temp_storage_bytes, m_cell_counts, d_bin_offsets, scan_items, stream));
+
+        // Launch kernel to compute permutation
+        grid_compute_permutation<<<grid_dim, block_dim, 0, stream>>>(
+            d_positions, d_bin_offsets, d_permutation, m_config);
+        cuda_check(cudaGetLastError());
+
+        if constexpr (ST == KernelStrategy::GridBased)
+        {
+            // Compute prefix sum to get block offsets
+            cuda_check(cub::DeviceScan::ExclusiveSum(
+                m_temp_storage, m_temp_storage_bytes, m_blocks_per_cell, m_block_offsets, scan_items, stream));
+
+            // Unused trailing blocks stay zero-count sentinels.
+            cuda_check(cudaMemsetAsync(d_block_info, 0, sizeof(BlockInfo) * m_max_blocks, stream));
+            // Launch kernel to assign block information
+            block_dim = dim3(256, 1, 1);
+            grid_dim = dim3((m_config.cell_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
+            assign_block_info<<<grid_dim, block_dim, 0, stream>>>(
+                m_cell_counts, m_block_offsets, d_block_info, m_config);
+            cuda_check(cudaGetLastError());
+        }
+    }
 
     void initialize(
         FloatArray3D positions,   // Shape (batch_size, N, DIM)
@@ -1942,58 +2012,10 @@ public:
         if constexpr (ST == KernelStrategy::GridBased)
             validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
 
-        // Cast device pointers
-        const ParticlePosition<DIM> *d_positions = reinterpret_cast<const ParticlePosition<DIM> *>(positions.data());
-
-        cuda_check(cudaMemset(m_cell_counts, 0, sizeof(uint32_t) * (m_config.cell_count * m_config.batch_size + 1)));
-        if constexpr (ST == KernelStrategy::GridBased)
-            cuda_check(cudaMemset(m_blocks_per_cell, 0, sizeof(uint32_t) * (m_config.cell_count * m_config.batch_size + 1)));
-
-        // Launch kernel
-        dim3 block_dim(256, 1, 1);
-        dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-        grid_count_particles<DIM, BC, ST><<<grid_dim, block_dim>>>(
-            d_positions, m_cell_counts, m_blocks_per_cell, m_config);
-        cuda_check(cudaGetLastError());
-
-        uint32_t *d_permutation = reinterpret_cast<uint32_t *>(permutation.data());
-        uint32_t *d_bin_offsets = reinterpret_cast<uint32_t *>(bin_offsets.data());
-
-        cuda_check(cudaMemset(d_permutation, 0, sizeof(uint32_t) * (m_config.particle_count * m_config.batch_size)));
-        cuda_check(cudaMemset(d_bin_offsets, 0, sizeof(uint32_t) * (m_config.batch_size * m_config.cell_count + 1)));
-        cuda_check(cudaMemset(m_bin_write_indices, 0, sizeof(uint32_t) * (m_config.cell_count * m_config.batch_size)));
-
-        // Compute prefix sum to get bin offsets
-        cub::DeviceScan::ExclusiveSum(
-            m_temp_storage,
-            m_temp_storage_bytes,
-            m_cell_counts,
-            d_bin_offsets,
-            m_config.batch_size * m_config.cell_count + 1);
-
-        // Launch kernel to compute permutation
-        grid_compute_permutation<<<grid_dim, block_dim>>>(
-            d_positions, d_bin_offsets, m_bin_write_indices, d_permutation, m_config);
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            BlockInfo *d_block_info = reinterpret_cast<BlockInfo *>(block_info.data());
-            // Compute prefix sum to get block offsets
-            cuda_check(cudaMemset(m_block_offsets, 0, sizeof(uint32_t) * (m_config.cell_count * m_config.batch_size + 1)));
-            cub::DeviceScan::ExclusiveSum(
-                m_temp_storage,
-                m_temp_storage_bytes,
-                m_blocks_per_cell,
-                m_block_offsets,
-                m_config.batch_size * m_config.cell_count + 1);
-
-            cuda_check(cudaMemset(d_block_info, 0, sizeof(BlockInfo) * m_max_blocks));
-            // Launch kernel to assign block information
-            block_dim = dim3(256, 1, 1);
-            grid_dim = dim3((m_config.cell_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-            assign_block_info<<<grid_dim, block_dim>>>(
-                m_cell_counts, m_block_offsets, d_block_info, m_config);
-        }
+        initialize_impl(reinterpret_cast<const ParticlePosition<DIM> *>(positions.data()),
+                        reinterpret_cast<uint32_t *>(permutation.data()),
+                        reinterpret_cast<uint32_t *>(bin_offsets.data()),
+                        reinterpret_cast<BlockInfo *>(block_info.data()), 0);
     }
 
     void bin_particles(
@@ -2060,138 +2082,247 @@ public:
             feature_dim, m_config);
     }
 
-    void perception_density_forward(
-        FloatArray3D positions, FloatArray2D mass, FloatArray2D volume, FloatArray3D density_gradient,
-        IntArray1D bin_offsets, BlockInfoArray block_info,
-        bool perceive_density_grad, uint64_t stream = 0)
+    // Fused NPA perception (perception.cuh, FUSED_PERCEPTION.md): fixed masses,
+    // detached positions, native channel counts 4/8/16/32 (sph.py pads others).
+    // One forward call builds the grid, bins, and perceives; one backward call
+    // propagates the perception adjoint, adds the binned-state cotangent, and
+    // unbins. `snapshot` holds int32 words [block_info (max_blocks*4) |
+    // bin_offsets (B*cells+1) | permutation (B*N)]; `workspace` holds the
+    // forward state saved for backward, laid out by fused_workspace_layout.
+    struct FusedWorkspace {
+        size_t volume, density_gradient, gradient_sum, gradient_values, mass, total_mass, size;
+    };
+
+    FusedWorkspace fused_workspace_layout(uint32_t features, bool density_grad, bool normalize_state_grad,
+                                          bool save_backward, bool has_mass) const
     {
-        if constexpr (ST != KernelStrategy::GridBased) {
-            throw std::runtime_error("Fused perception requires grid mode.");
-        } else {
-            validate_array_shape(positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "positions");
-            validate_array_shape(mass, {m_config.batch_size, m_config.particle_count}, "mass");
-            validate_array_shape(volume, {m_config.batch_size, m_config.particle_count}, "volume");
-            if (perceive_density_grad)
-                validate_array_shape(density_gradient, {m_config.batch_size, m_config.particle_count, DIM}, "density_gradient");
-            validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
-            auto position_ptr = reinterpret_cast<const ParticlePosition<DIM> *>(positions.data());
-            auto offset_ptr = reinterpret_cast<const uint32_t *>(bin_offsets.data());
-            auto info_ptr = reinterpret_cast<const BlockInfo *>(block_info.data());
-            auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-            if (perceive_density_grad)
-                fused_perception::density_forward<DIM, BC, true><<<m_max_blocks, fused_perception::DENSITY_THREADS, 0, cuda_stream>>>(
-                    position_ptr, mass.data(), volume.data(), density_gradient.data(), offset_ptr, info_ptr, m_config);
-            else
-                fused_perception::density_forward<DIM, BC, false><<<m_max_blocks, fused_perception::DENSITY_THREADS, 0, cuda_stream>>>(
-                    position_ptr, mass.data(), volume.data(), nullptr, offset_ptr, info_ptr, m_config);
-            cuda_check(cudaGetLastError());
-        }
+        size_t particles = size_t(m_config.batch_size) * m_config.particle_count;
+        FusedWorkspace layout{};
+        layout.volume = 0;
+        layout.density_gradient = particles;
+        layout.gradient_sum = layout.density_gradient + (density_grad ? particles * DIM : 0);
+        layout.gradient_values = layout.gradient_sum + (save_backward ? particles * DIM : 0);
+        layout.mass = layout.gradient_values + (save_backward && normalize_state_grad ? particles * features * DIM : 0);
+        layout.total_mass = layout.mass + (has_mass ? particles : 0);
+        layout.size = layout.total_mass + (has_mass && density_grad ? m_config.batch_size : 0);
+        return layout;
     }
 
-    void perception_forward(
-        FloatArray3D positions, FloatArray3D state, FloatArray2D volume,
-        FloatArray3D density_gradient, FloatArray1D eps0,
-        FloatArray3D perception, FloatArray4D gradient_values, FloatArray3D gradient_sum,
-        IntArray1D bin_offsets, BlockInfoArray block_info,
-        bool perceive_density_grad, bool normalize_state_grad,
-        bool normalize_density_grad, bool save_backward, uint64_t stream = 0)
+    size_t fused_workspace_size(uint32_t features, bool density_grad, bool normalize_state_grad,
+                                bool save_backward, bool has_mass) const
+    {
+        return fused_workspace_layout(features, density_grad, normalize_state_grad, save_backward, has_mass).size;
+    }
+
+    size_t fused_snapshot_words() const
+    {
+        return size_t(m_max_blocks) * 4 + size_t(m_config.batch_size) * m_config.cell_count + 1
+             + size_t(m_config.batch_size) * m_config.particle_count;
+    }
+
+    void fused_perception_forward(
+        FloatArray3D positions, FloatArray3D state, std::optional<FloatArray2D> mass, FloatArray1D eps0,
+        IntArray1D snapshot, FloatArray3D binned_positions, FloatArray3D binned_state,
+        FloatArray3D perception, FloatArray1D workspace,
+        bool perceive_density_grad, bool normalize_state_grad, bool normalize_density_grad,
+        bool save_backward, uint64_t stream = 0)
     {
         if constexpr (ST != KernelStrategy::GridBased) {
             throw std::runtime_error("Fused perception requires grid mode.");
         } else {
             uint32_t features = state.shape(2);
             uint32_t output_dim = features * (2 + DIM) + (perceive_density_grad ? DIM : 0);
+            FusedWorkspace layout = fused_workspace_layout(
+                features, perceive_density_grad, normalize_state_grad, save_backward, mass.has_value());
             validate_array_shape(positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "positions");
             validate_array_shape(state, {m_config.batch_size, m_config.particle_count, features}, "state");
-            validate_array_shape(volume, {m_config.batch_size, m_config.particle_count}, "volume");
+            if (mass)
+                validate_array_shape(*mass, {m_config.batch_size, m_config.particle_count}, "mass");
             validate_array_shape(eps0, {1}, "eps0");
+            validate_array_shape(snapshot, {fused_snapshot_words()}, "snapshot");
+            validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
+            validate_array_shape(binned_state, {m_config.batch_size, m_config.particle_count, features}, "binned_state");
             validate_array_shape(perception, {m_config.batch_size, m_config.particle_count, output_dim}, "perception");
-            if (perceive_density_grad)
-                validate_array_shape(density_gradient, {m_config.batch_size, m_config.particle_count, DIM}, "density_gradient");
-            if (save_backward) {
-                validate_array_shape(gradient_sum, {m_config.batch_size, m_config.particle_count, DIM}, "gradient_sum");
-                if (normalize_state_grad)
-                    validate_array_shape(gradient_values, {m_config.batch_size, m_config.particle_count, features, DIM}, "gradient_values");
-            }
-            validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
+            validate_array_shape(workspace, {layout.size}, "workspace");
             auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-            auto launch = [&](auto feature_count) {
-                constexpr int FEATURES = decltype(feature_count)::value;
-                fused_perception::forward<DIM, FEATURES, BC><<<m_max_blocks, fused_perception::BLOCK_THREADS, 0, cuda_stream>>>(
-                    reinterpret_cast<const ParticlePosition<DIM> *>(positions.data()),
-                    state.data(), volume.data(), density_gradient.data(), eps0.data(),
-                    perception.data(), gradient_values.data(), gradient_sum.data(),
-                    reinterpret_cast<const uint32_t *>(bin_offsets.data()),
-                    reinterpret_cast<const BlockInfo *>(block_info.data()), m_config,
-                    perceive_density_grad, normalize_state_grad, normalize_density_grad, save_backward);
-            };
-            if (features == 4)
-                launch(std::integral_constant<int, 4>{});
-            else if (features == 8)
-                launch(std::integral_constant<int, 8>{});
-            else if (features == 16)
-                launch(std::integral_constant<int, 16>{});
-            else if (features == 32)
-                launch(std::integral_constant<int, 32>{});
-            else
-                throw std::runtime_error("Fused perception supports exactly 4, 8, 16, or 32 state channels.");
+            auto *block_info = reinterpret_cast<BlockInfo *>(snapshot.data());
+            auto *bin_offsets = reinterpret_cast<uint32_t *>(snapshot.data()) + size_t(m_max_blocks) * 4;
+            uint32_t *permutation = bin_offsets + size_t(m_config.batch_size) * m_config.cell_count + 1;
+            auto *x = reinterpret_cast<const ParticlePosition<DIM> *>(positions.data());
+            auto *x_bin = reinterpret_cast<ParticlePosition<DIM> *>(binned_positions.data());
+            float *base = workspace.data();
+            // Omitted masses read the persistent ones buffer (binned ones are ones).
+            float *mass_bin = mass ? base + layout.mass : m_unit_mass;
+
+            initialize_impl(x, permutation, bin_offsets, block_info, cuda_stream);
+            dim3 block_dim(256, 1, 1);
+            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
+            apply_permutation<<<grid_dim, block_dim, 0, cuda_stream>>>(
+                x, state.data(), mass ? mass->data() : nullptr, permutation,
+                x_bin, binned_state.data(), mass ? mass_bin : nullptr, features, m_config);
             cuda_check(cudaGetLastError());
+            // Explicit masses: per-sample totals normalize the density gradient.
+            const float *total_mass = nullptr;
+            if (mass && perceive_density_grad) {
+                fused_perception::total_mass<<<m_config.batch_size, fused_perception::TOTAL_MASS_THREADS, 0, cuda_stream>>>(
+                    mass->data(), m_config.particle_count, base + layout.total_mass);
+                cuda_check(cudaGetLastError());
+                total_mass = base + layout.total_mass;
+            }
+            launch_fused_density(x_bin, mass_bin, base + layout.volume,
+                                 perceive_density_grad ? base + layout.density_gradient : nullptr,
+                                 bin_offsets, block_info, perceive_density_grad, cuda_stream);
+            launch_fused_features(x_bin, binned_state.data(), base + layout.volume,
+                                  base + layout.density_gradient, total_mass, eps0.data(), perception.data(),
+                                  base + layout.gradient_values, base + layout.gradient_sum,
+                                  bin_offsets, block_info, features, perceive_density_grad,
+                                  normalize_state_grad, normalize_density_grad, save_backward, cuda_stream);
         }
     }
 
-    void perception_backward(
-        FloatArray3D positions, FloatArray2D volume, FloatArray3D grad_perception,
-        FloatArray4D gradient_values, FloatArray3D gradient_sum, FloatArray1D eps0,
-        FloatArray4D incoming, FloatArray3D grad_state,
-        IntArray1D bin_offsets, BlockInfoArray block_info,
-        bool perceive_density_grad, bool normalize_state_grad, uint64_t stream = 0)
+    void fused_perception_backward(
+        FloatArray3D binned_positions, FloatArray1D workspace, std::optional<FloatArray3D> grad_perception,
+        std::optional<FloatArray3D> grad_binned_positions, std::optional<FloatArray3D> grad_binned_state,
+        FloatArray1D eps0, IntArray1D snapshot, FloatArray1D scratch,
+        std::optional<FloatArray3D> grad_positions, std::optional<FloatArray3D> grad_state, uint32_t features,
+        bool perceive_density_grad, bool normalize_state_grad, bool has_mass, uint64_t stream = 0)
     {
         if constexpr (ST != KernelStrategy::GridBased) {
             throw std::runtime_error("Fused perception requires grid mode.");
         } else {
-            uint32_t features = grad_state.shape(2);
             uint32_t output_dim = features * (2 + DIM) + (perceive_density_grad ? DIM : 0);
-            validate_array_shape(positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "positions");
-            validate_array_shape(volume, {m_config.batch_size, m_config.particle_count}, "volume");
-            validate_array_shape(grad_perception, {m_config.batch_size, m_config.particle_count, output_dim}, "grad_perception");
-            if (normalize_state_grad)
-                validate_array_shape(gradient_values, {m_config.batch_size, m_config.particle_count, features, DIM}, "gradient_values");
-            validate_array_shape(gradient_sum, {m_config.batch_size, m_config.particle_count, DIM}, "gradient_sum");
+            size_t particles = size_t(m_config.batch_size) * m_config.particle_count;
+            // The saved forward state is read only for a perception cotangent, in
+            // which case the forward ran with save_backward.
+            FusedWorkspace layout = fused_workspace_layout(
+                features, perceive_density_grad, normalize_state_grad, true, has_mass);
+            validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
+            if (grad_perception)
+                validate_array_shape(workspace, {layout.size}, "workspace");
             validate_array_shape(eps0, {1}, "eps0");
-            validate_array_shape(incoming, {m_config.batch_size, m_config.particle_count, DIM + 1, features}, "incoming");
-            validate_array_shape(grad_state, {m_config.batch_size, m_config.particle_count, features}, "grad_state");
-            validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
+            validate_array_shape(snapshot, {fused_snapshot_words()}, "snapshot");
+            if (grad_state)
+                validate_array_shape(*grad_state, {m_config.batch_size, m_config.particle_count, features}, "grad_state");
+            if (grad_perception) {
+                validate_array_shape(*grad_perception, {m_config.batch_size, m_config.particle_count, output_dim}, "grad_perception");
+                validate_array_shape(scratch, {particles * features * (DIM + 2)}, "scratch");
+            }
+            if (grad_binned_state)
+                validate_array_shape(*grad_binned_state, {m_config.batch_size, m_config.particle_count, features}, "grad_binned_state");
+            if (grad_state.has_value() != (grad_perception.has_value() || grad_binned_state.has_value()))
+                throw std::runtime_error("grad_state requires a perception or binned-state cotangent, and vice versa");
+            if (grad_positions.has_value() != grad_binned_positions.has_value())
+                throw std::runtime_error("grad_positions and grad_binned_positions must be given together");
+            if (grad_positions) {
+                validate_array_shape(*grad_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "grad_positions");
+                validate_array_shape(*grad_binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "grad_binned_positions");
+            }
             auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-            auto launch = [&](auto feature_count) {
-                constexpr int FEATURES = decltype(feature_count)::value;
-                unsigned int particles = m_config.batch_size * m_config.particle_count;
-                constexpr int PREPARE_THREADS = fused_perception::BACKWARD_PREPARE_THREADS;
-                unsigned int blocks = (particles * FEATURES + PREPARE_THREADS - 1) / PREPARE_THREADS;
-                fused_perception::backward_prepare<DIM, FEATURES><<<blocks, PREPARE_THREADS, 0, cuda_stream>>>(
-                    grad_perception.data(), gradient_values.data(), gradient_sum.data(), eps0.data(),
-                    incoming.data(), grad_state.data(), particles, output_dim, m_config.eps, normalize_state_grad);
-                cuda_check(cudaGetLastError());
-                fused_perception::backward<DIM, FEATURES, BC><<<m_max_blocks, fused_perception::BLOCK_THREADS, 0, cuda_stream>>>(
-                    reinterpret_cast<const ParticlePosition<DIM> *>(positions.data()), volume.data(),
-                    incoming.data(), grad_state.data(), reinterpret_cast<const uint32_t *>(bin_offsets.data()),
-                    reinterpret_cast<const BlockInfo *>(block_info.data()), m_config);
-            };
-            if (features == 4)
-                launch(std::integral_constant<int, 4>{});
-            else if (features == 8)
-                launch(std::integral_constant<int, 8>{});
-            else if (features == 16)
-                launch(std::integral_constant<int, 16>{});
-            else if (features == 32)
-                launch(std::integral_constant<int, 32>{});
-            else
-                throw std::runtime_error("Fused perception supports exactly 4, 8, 16, or 32 state channels.");
+            auto *block_info = reinterpret_cast<const BlockInfo *>(snapshot.data());
+            auto *bin_offsets = reinterpret_cast<const uint32_t *>(snapshot.data()) + size_t(m_max_blocks) * 4;
+            const uint32_t *permutation = bin_offsets + size_t(m_config.batch_size) * m_config.cell_count + 1;
+            const float *base = workspace.data();
+            // Binned perception adjoint first; the binned-state cotangent is added
+            // while unbinning (the sum autograd would otherwise form).
+            const float *state_source = grad_binned_state ? grad_binned_state->data() : nullptr;
+            const float *state_addend = nullptr;
+            if (grad_perception) {
+                // scratch: [incoming cotangents (B*N*(DIM+1)*C) | binned state adjoint (B*N*C)]
+                float *perception_grad_state = scratch.data() + particles * features * (DIM + 1);
+                launch_fused_backward(
+                    reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data()), base + layout.volume,
+                    grad_perception->data(), base + layout.gradient_values, base + layout.gradient_sum, eps0.data(),
+                    scratch.data(), perception_grad_state, bin_offsets, block_info, features,
+                    perceive_density_grad, normalize_state_grad, cuda_stream);
+                state_addend = state_source;
+                state_source = perception_grad_state;
+            }
+            dim3 block_dim(256, 1, 1);
+            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
+            backward_apply_permutation<<<grid_dim, block_dim, 0, cuda_stream>>>(
+                grad_binned_positions ? reinterpret_cast<const ParticlePosition<DIM> *>(grad_binned_positions->data()) : nullptr,
+                state_source, nullptr, permutation,
+                grad_positions ? reinterpret_cast<ParticlePosition<DIM> *>(grad_positions->data()) : nullptr,
+                grad_state ? grad_state->data() : nullptr, nullptr, features, m_config, state_addend);
             cuda_check(cudaGetLastError());
         }
     }
+
+private:
+    // Fused-perception launch helpers; pointers are in binned particle order.
+    void launch_fused_density(
+        const ParticlePosition<DIM> *positions, const float *mass, float *volume, float *density_gradient,
+        const uint32_t *bin_offsets, const BlockInfo *block_info, bool perceive_density_grad, cudaStream_t stream)
+    {
+        if (perceive_density_grad)
+            fused_perception::density_forward<DIM, BC, true>
+                <<<m_max_blocks, fused_perception::DensityLayout<DIM, true>::THREADS, 0, stream>>>(
+                    positions, mass, volume, density_gradient, bin_offsets, block_info, m_config);
+        else
+            fused_perception::density_forward<DIM, BC, false>
+                <<<m_max_blocks, fused_perception::DensityLayout<DIM, false>::THREADS, 0, stream>>>(
+                    positions, mass, volume, nullptr, bin_offsets, block_info, m_config);
+        cuda_check(cudaGetLastError());
+    }
+
+    template <typename Launch>
+    static void dispatch_features(uint32_t features, Launch &&launch)
+    {
+        if (features == 4)
+            launch(std::integral_constant<int, 4>{});
+        else if (features == 8)
+            launch(std::integral_constant<int, 8>{});
+        else if (features == 16)
+            launch(std::integral_constant<int, 16>{});
+        else if (features == 32)
+            launch(std::integral_constant<int, 32>{});
+        else
+            throw std::runtime_error("Fused perception supports exactly 4, 8, 16, or 32 state channels.");
+    }
+
+    void launch_fused_features(
+        const ParticlePosition<DIM> *positions, const float *state, const float *volume,
+        const float *density_gradient, const float *total_mass, const float *eps0,
+        float *perception, float *gradient_values,
+        float *gradient_sum, const uint32_t *bin_offsets, const BlockInfo *block_info, uint32_t features,
+        bool perceive_density_grad, bool normalize_state_grad, bool normalize_density_grad,
+        bool save_backward, cudaStream_t stream)
+    {
+        dispatch_features(features, [&](auto feature_count) {
+            constexpr int FEATURES = decltype(feature_count)::value;
+            constexpr int THREADS = fused_perception::ForwardLayout<DIM, FEATURES>::THREADS;
+            fused_perception::forward<DIM, FEATURES, BC><<<m_max_blocks, THREADS, 0, stream>>>(
+                positions, state, volume, density_gradient, total_mass, eps0, perception, gradient_values, gradient_sum,
+                bin_offsets, block_info, m_config,
+                perceive_density_grad, normalize_state_grad, normalize_density_grad, save_backward);
+        });
+        cuda_check(cudaGetLastError());
+    }
+
+    void launch_fused_backward(
+        const ParticlePosition<DIM> *positions, const float *volume, const float *grad_perception,
+        const float *gradient_values, const float *gradient_sum, const float *eps0, float *incoming,
+        float *grad_state, const uint32_t *bin_offsets, const BlockInfo *block_info, uint32_t features,
+        bool perceive_density_grad, bool normalize_state_grad, cudaStream_t stream)
+    {
+        uint32_t output_dim = features * (2 + DIM) + (perceive_density_grad ? DIM : 0);
+        dispatch_features(features, [&](auto feature_count) {
+            constexpr int FEATURES = decltype(feature_count)::value;
+            unsigned int particles = m_config.batch_size * m_config.particle_count;
+            constexpr int PREPARE_THREADS = fused_perception::BACKWARD_PREPARE_THREADS;
+            unsigned int blocks = (particles * FEATURES + PREPARE_THREADS - 1) / PREPARE_THREADS;
+            fused_perception::backward_prepare<DIM, FEATURES><<<blocks, PREPARE_THREADS, 0, stream>>>(
+                grad_perception, gradient_values, gradient_sum, eps0,
+                incoming, grad_state, particles, output_dim, m_config.eps, normalize_state_grad);
+            cuda_check(cudaGetLastError());
+            constexpr int THREADS = fused_perception::BackwardLayout<DIM, FEATURES>::THREADS;
+            fused_perception::backward<DIM, FEATURES, BC><<<m_max_blocks, THREADS, 0, stream>>>(
+                positions, volume, incoming, grad_state, bin_offsets, block_info, m_config);
+        });
+        cuda_check(cudaGetLastError());
+    }
+
+public:
 
     void density_forward(
         FloatArray3D binned_positions, // Shape (batch_size, N, DIM)
@@ -3344,18 +3475,18 @@ void safe_inv_sym_mat(
 // Macro to add common properties and methods
 #define ADD_COMMON_GRID_BINDINGS(grid_class, GridType, pos_shape)                                                                 \
     grid_class                                                                                                                    \
-        .def("perception_density_forward", &GridType::perception_density_forward,                                                \
-             "positions"_a, "mass"_a, "volume"_a, "density_gradient"_a, "bin_offsets"_a, "block_info"_a,                         \
-             "perceive_density_grad"_a, "stream"_a = 0)                                                                          \
-        .def("perception_forward", &GridType::perception_forward,                                                                \
-             "positions"_a, "state"_a, "volume"_a, "density_gradient"_a, "eps0"_a, "perception"_a,                              \
-             "gradient_values"_a, "gradient_sum"_a, "bin_offsets"_a, "block_info"_a,                                              \
-             "perceive_density_grad"_a, "normalize_state_grad"_a, "normalize_density_grad"_a,                                    \
-             "save_backward"_a, "stream"_a = 0)                                                                                  \
-        .def("perception_backward", &GridType::perception_backward,                                                              \
-             "positions"_a, "volume"_a, "grad_perception"_a, "gradient_values"_a, "gradient_sum"_a, "eps0"_a,                    \
-             "incoming"_a, "grad_state"_a, "bin_offsets"_a, "block_info"_a,                                                       \
-             "perceive_density_grad"_a, "normalize_state_grad"_a, "stream"_a = 0)                                                \
+        .def("fused_perception_forward", &GridType::fused_perception_forward,                                                    \
+             "positions"_a, "state"_a, "mass"_a.none(), "eps0"_a, "snapshot"_a, "binned_positions"_a,                             \
+             "binned_state"_a, "perception"_a, "workspace"_a, "perceive_density_grad"_a, "normalize_state_grad"_a,               \
+             "normalize_density_grad"_a, "save_backward"_a, "stream"_a = 0)                                                      \
+        .def("fused_perception_backward", &GridType::fused_perception_backward,                                                  \
+             "binned_positions"_a, "workspace"_a, "grad_perception"_a.none(), "grad_binned_positions"_a.none(),                  \
+             "grad_binned_state"_a.none(), "eps0"_a, "snapshot"_a, "scratch"_a, "grad_positions"_a.none(),                       \
+             "grad_state"_a.none(), "features"_a, "perceive_density_grad"_a, "normalize_state_grad"_a, "has_mass"_a,             \
+             "stream"_a = 0)                                                                                                      \
+        .def("fused_workspace_size", &GridType::fused_workspace_size,                                                            \
+             "features"_a, "density_grad"_a, "normalize_state_grad"_a, "save_backward"_a, "has_mass"_a)                          \
+        .def_prop_ro("fused_snapshot_words", &GridType::fused_snapshot_words, "Fused snapshot buffer length (int32 words)")      \
         .def_prop_ro("grid_size_x", &GridType::grid_size_x, "Grid size in x dimension")                                           \
         .def_prop_ro("grid_size_y", &GridType::grid_size_y, "Grid size in y dimension")                                           \
         .def_prop_ro("eps", &GridType::eps, "Grid cell spacing")                                                                  \

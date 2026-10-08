@@ -71,9 +71,17 @@ class TextureLoss(SplatLoss):
             else:
                 self.target_img = [self.target_color]  # [1,3,H,W]
 
-            self.target_features = [
-                self.get_vgg_features(img) for img in self.target_img
-            ]
+            self.target_features = self.get_image_features(self.target_img)
+
+    def get_image_features(self, images):
+        # Color and density images share one VGG pass (the network treats batch
+        # elements independently); returns features per image, then per layer.
+        if len(images) == 1:
+            return [self.get_vgg_features(images[0])]
+        sizes = [img.shape[0] for img in images]
+        features = self.get_vgg_features(torch.cat(images, dim=0))
+        split = [feature.split(sizes, dim=0) for feature in features]
+        return [[layer[i] for layer in split] for i in range(len(images))]
 
     def get_vgg_features(self, imgs):
         mean = torch.tensor([0.485, 0.456, 0.406], device=imgs.device)[:, None, None]
@@ -152,7 +160,7 @@ class TextureLoss(SplatLoss):
         if self.density_as_texture:
             generated_img.append(self.density_transformation(img_density.repeat(1, 3, 1, 1)))
 
-        generated_features = [self.get_vgg_features(img) for img in generated_img]
+        generated_features = self.get_image_features(generated_img)
         if self.density_as_texture:
             density_loss = self.ot_loss(
                 generated_features[1], self.target_features[1]

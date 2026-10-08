@@ -3,7 +3,7 @@ import numpy as np
 import io
 import requests
 from PIL import Image
-from sph import (
+from sphops import (
     blur,
     density,
     count,
@@ -13,19 +13,20 @@ from sph import (
     HashGrid,
     bin_particles,
 )
-from torch_sph import density as density_torch, blur as blur_torch
-from torch_sph import gradient as gradient_torch, count as count_torch
+from sphops.testing.torch_sph import density as density_torch, blur as blur_torch
+from sphops.testing.torch_sph import gradient as gradient_torch, count as count_torch
 
-from utils import relative_error, benchmark_function_forward
+from sphops.testing.utils import relative_error, benchmark_function_forward
 
 
 def load_target_image(target_str, size):
     if len(target_str) == 1:
         code_points = [f"{ord(c):04x}" for c in target_str]
         code = "_".join(code_points)
+        # Noto Emoji's main branch no longer ships PNGs; v2.051 is the last release with png/512.
         target_str = (
-            "https://github.com/googlefonts/noto-emoji/blob/main/png/512/"
-            f"emoji_u{code}.png?raw=true"
+            "https://raw.githubusercontent.com/googlefonts/noto-emoji/v2.051/png/512/"
+            f"emoji_u{code}.png"
         )
 
     if target_str.startswith(("http://", "https://")):
@@ -170,12 +171,6 @@ torch.cuda.synchronize()
 del x_bin, s_bin, loss, grid, rho, co, s_blur, grad_s, M
 
 
-# Linux:
-# ncu --set full -k regex:".*(forward|backward|permutation|grid_count|block_info).*" --export report4.ncu-rep --force-overwrite --import-source yes --source-folders . python benchmark.py; ncu-ui report4.ncu-rep
-
-# Windows (PowerShell):
-# ncu --set full -k 'regex:.*(forward|backward|permutation|grid_count|block_info).*' --export .\report4.ncu-rep --force-overwrite --import-source yes --source-folders . python .\benchmark.py
-
-
-# Linux:      ncu --set full -k regex:".*(forward|backward|permutation|grid_count|block_info).*" --export ncu_reports/rep1.ncu-rep --force-overwrite --import-source yes --source-folders . python ncu_profile.py
-# PowerShell: ncu --set full -k 'regex:".*(forward|backward|permutation|grid_count|block_info).*"' --export ncu_reports/rep1.ncu-rep --force-overwrite --import-source yes --source-folders . python ncu_profile.py
+# Run from the repository root (reports go to sphops/ncu_reports):
+# Linux:      ncu --set full -k regex:".*(forward|backward|permutation|grid_count|block_info).*" --export sphops/ncu_reports/rep1.ncu-rep --force-overwrite --import-source yes --source-folders sphops python -m sphops.testing.ncu_profile
+# PowerShell: ncu --set full -k 'regex:".*(forward|backward|permutation|grid_count|block_info).*"' --export sphops/ncu_reports/rep1.ncu-rep --force-overwrite --import-source yes --source-folders sphops python -m sphops.testing.ncu_profile

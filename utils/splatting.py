@@ -100,14 +100,81 @@ def splat_particles(
     return out
 
 
-def splat_particles_batch(x, color, **kwargs):
-    B, P, _ = x.shape
-    B2, P2, _ = color.shape
+def splat_particles_batch(
+    x,
+    color,
+    img_size=256,
+    sigma=2.0,
+    lo=-1.0,
+    hi=1.0,
+    normalize_color=True,
+    y_up=False,
+    pixel_size=2.0 / 128.0,
+):
+    """
+    Batched splat_particles: (B, N, 2) positions and (B, N, D) attributes to a
+    (B, H, W, 4) image, in one pass without a per-sample loop or host sync.
 
-    assert B == B2 and P == P2
+    Per-pixel arithmetic matches splat_particles. Instead of compacting the
+    in-image kernel taps with a boolean mask (which synchronizes with the host),
+    off-image taps add an exact zero to a clamped in-image pixel.
+    """
+    B, N, _ = x.shape
+    B2, N2, _ = color.shape
+    assert B == B2 and N == N2
+    device = x.device
+    dtype = x.dtype
 
-    outs = [splat_particles(x[b], color[b], **kwargs) for b in range(B)]
-    return torch.stack(outs, dim=0)
+    pos_pix = (x - lo) / (hi - lo) * (img_size - 1)
+    if y_up:
+        pos_pix = torch.stack([pos_pix[..., 0], (img_size - 1) - pos_pix[..., 1]], dim=-1)
+
+    if normalize_color:
+        sigma = sigma * img_size * pixel_size / (hi - lo)
+    radius = max(1, math.ceil(5 * float(sigma)))
+    P = 2 * radius + 1
+    offs = torch.arange(-radius, radius + 1, device=device, dtype=torch.int64)
+
+    base = torch.floor(pos_pix)  # [B,N,2]
+    cx = base[..., 0].long()
+    cy = base[..., 1].long()
+    frac = pos_pix - base
+
+    # The P x P tap grid is separable: row i has y offset offs[i], column j has
+    # x offset offs[j] (splat_particles' meshgrid "ij" order, flattened i*P+j).
+    x_idx = cx[..., None] + offs  # [B,N,P]
+    y_idx = cy[..., None] + offs
+    mask = ((y_idx >= 0) & (y_idx < img_size))[..., :, None] & (
+        (x_idx >= 0) & (x_idx < img_size)
+    )[..., None, :]  # [B,N,P,P]
+    flat_idx = (
+        y_idx.clamp(0, img_size - 1)[..., :, None] * img_size
+        + x_idx.clamp(0, img_size - 1)[..., None, :]
+        + (torch.arange(B, device=device) * img_size * img_size)[:, None, None, None]
+    ).reshape(B, N, P * P)
+    mask = mask.reshape(B, N, P * P)
+
+    dx_f = offs - frac[..., 0:1]  # [B,N,P]
+    dy_f = offs - frac[..., 1:2]
+    distance = (dx_f**2)[..., None, :] + (dy_f**2)[..., :, None]  # dx^2 + dy^2
+    g = torch.exp(-distance.reshape(B, N, P * P) / (2 * sigma * sigma))
+
+    if normalize_color:
+        g = g / (1e-8 + torch.sum(g, dim=-1, keepdim=True))
+        g = g * (img_size * pixel_size / (hi - lo)) ** 2.0
+
+    colors = color[..., -3:]
+    w = torch.where(mask, g, 0.0)  # [B,N,P2]
+    # Zero masked products too, so off-image taps never carry nonfinite colors.
+    c = torch.where(mask[..., None], colors[:, :, None, :] * w[..., None], 0.0)
+
+    flat_idx = flat_idx.reshape(-1, 1)
+    density = torch.zeros(B * img_size * img_size, 1, device=device, dtype=dtype)
+    rgb = torch.zeros(B * img_size * img_size, 3, device=device, dtype=dtype)
+    density.scatter_add_(0, flat_idx, w.reshape(-1, 1))
+    rgb.scatter_add_(0, flat_idx.expand(-1, 3), c.reshape(-1, 3))
+
+    return torch.cat([rgb, density], dim=1).view(B, img_size, img_size, 4)
 
 
 def splat_particles_sections(x, color, sections, **kwargs):

@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from sphops import perception, bin_particles, unbin_particles, HashGrid
+from sphops import fused_perception, fused_perception_supported
 
 
 class NPA(torch.nn.Module):
@@ -19,7 +20,8 @@ class NPA(torch.nn.Module):
         output_dims=None, # Output dimensions for the read-out MLP. 
         stopgrad_pos=True, # Whether to Detach input position to the Perception
         stopgrad_state=False, # Whether to Detach input state to the Perception
-        fused_perception=True, # Fused CUDA perception when supported; otherwise use the original operations.
+        fused_perception=True, # Fused CUDA perception when supported; otherwise the standalone SPH operators.
+        compile_step=False, # Opt-in runtime compilation of MLP + Euler update, not hash-grid/perception.
     ):
         super().__init__()
         self.spatial_dims = spatial_dims
@@ -34,6 +36,8 @@ class NPA(torch.nn.Module):
         self.stopgrad_pos = stopgrad_pos
         self.stopgrad_state = stopgrad_state
         self.fused_perception = fused_perception
+        self.compile_step = compile_step
+        self._compiled_euler = None
 
         perception_dim = state_dims * 2
         if density_grad:
@@ -79,6 +83,15 @@ class NPA(torch.nn.Module):
         return log_grad_norm * torch.nn.functional.normalize(grad_x, dim=-1)
 
     def perceive(self, x, s, grid: HashGrid, mass=None):
+        # The fused kernels perceive states but not position gradients.
+        if (self.fused_perception and self.state_grad and self.stopgrad_pos
+                and fused_perception_supported(x, s, grid, mass)):
+            return fused_perception(
+                x, s, grid, self.eps0, mass=mass, perceive_state=not self.stopgrad_state,
+                density_grad=self.density_grad, log_norm_grad=self.log_norm_grad,
+                log_norm_density_grad=self.log_norm_density_grad,
+            )
+
         with torch.no_grad():
             snapshot = grid.instantiate(x)
 
@@ -106,7 +119,6 @@ class NPA(torch.nn.Module):
             state_grad=self.state_grad, density_grad=self.density_grad,
             log_norm_grad=self.log_norm_grad,
             log_norm_density_grad=self.log_norm_density_grad,
-            use_fused=self.fused_perception,
         )
 
         return z, x_bin, s_bin, snapshot
@@ -116,6 +128,10 @@ class NPA(torch.nn.Module):
         z, x_bin, s_bin, snapshot = self.perceive(x, s, grid, mass=mass)
         self.last_snapshot = snapshot
 
+        dx_bin, ds_bin = self._adapt(z, eps)
+        return dx_bin, ds_bin, x_bin, s_bin
+
+    def _adapt(self, z, eps):
         y = self.model(z)  # (B, N, dim + C)
         dx_bin = y[..., : self.spatial_dims]
         dx_bin = (
@@ -124,7 +140,32 @@ class NPA(torch.nn.Module):
 
         ds_bin = y[..., self.spatial_dims :]  # (B, N, C)
 
-        return dx_bin, ds_bin, x_bin, s_bin
+        return dx_bin, ds_bin
+
+    def _euler_from_perception(self, z, x_bin, s_bin, update_mask, noise,
+                               eps, dt, intermediate, noise_scale, update_prob, noise_std):
+        dx_bin, ds_bin = self._adapt(z, eps)
+        dx_norm = dx_bin.norm(dim=-1).mean() if intermediate else None
+        if update_prob < 1.0:
+            update_mask = (update_mask < update_prob).float()
+        if dx_bin.shape[-1] != x_bin.shape[-1]:
+            dx_bin = torch.nn.functional.pad(dx_bin, (0, x_bin.shape[-1] - dx_bin.shape[-1]))
+        x = x_bin + dt * dx_bin * update_mask
+        s = s_bin + dt * ds_bin * update_mask
+        if noise is not None:
+            x = x + noise * noise_std * noise_scale * update_mask
+        return x, s, dx_norm
+
+    def _compiled_step(self, z, x_bin, s_bin, update_mask, noise,
+                       eps, dt, intermediate, noise_scale, update_prob, noise_std):
+        if self._compiled_euler is None:
+            # Hash-grid construction and native autograd stay outside Dynamo.
+            # No CUDA graph capture: rollout snapshots remain independently
+            # owned until backward, and no runtime autotuning is requested.
+            self._compiled_euler = torch.compile(self._euler_from_perception,
+                fullgraph=True, dynamic=False, options={"triton.cudagraphs": False})
+        return self._compiled_euler(z, x_bin, s_bin, update_mask, noise,
+                                    eps, dt, intermediate, noise_scale, update_prob, noise_std)
 
     def decode(self, s):
         if self.decoder is not None:
@@ -153,6 +194,18 @@ def step_euler(
     # Note that the updated position and state do not have the same 
     # particle index as the input (the particles might be shuffled)
     B, N, C = s.shape
+    if getattr(model, "compile_step", False):
+        z, x_bin, s_bin, snapshot = model.perceive(x, s, grid)
+        model.last_snapshot = snapshot
+        # Keep RNG generation outside compilation: identical PyTorch RNG
+        # consumption to the eager update, rather than compiler-specific RNG.
+        update_mask = 1.0
+        if update_prob < 1.0:
+            update_mask = torch.rand(B, N, 1, device=x.device)
+        noise = torch.randn_like(x_bin) if noise_std > 0 else None
+        x, s, dx_norm = model._compiled_step(z, x_bin, s_bin, update_mask, noise,
+            grid.eps, dt, intermediate, np.sqrt(dt), update_prob, noise_std)
+        return x, s, {"dx_norm": dx_norm} if intermediate else None
     dx_bin, ds_bin, x_bin, s_bin = model(x, s, grid)
 
     stats = None

@@ -109,7 +109,7 @@ def build_cases(manifest, *, batch_size=8, num_particles=4096, seed=42,
     manifest = Path(manifest).resolve()
     with manifest.open() as data:
         config = yaml.safe_load(data)
-    root = manifest.parent / config.get("asset_root", "..")
+    root = manifest.parent / config.get("asset_root", "../..")
     cases = []
     specs = [
         ("growing_seed", "growing_seed", "clamped", (16, 16), 0.1, 0.2),

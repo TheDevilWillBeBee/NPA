@@ -29,6 +29,7 @@ def load_image(path_or_url, size=128, alpha_premultiply=False):
         img = PIL.Image.open(path_or_url)
     else:
         r = requests.get(path_or_url)
+        r.raise_for_status()  # Otherwise an HTML error page fails later in PIL.
         img = PIL.Image.open(io.BytesIO(r.content))
     if img.mode == 'L':
         img = img.convert('RGB')
@@ -45,7 +46,8 @@ def load_image(path_or_url, size=128, alpha_premultiply=False):
 def load_emoji(emoji, **kwargs):
     code_points = [f"{ord(c):04x}" for c in emoji]
     code = '_'.join(code_points)
-    url = f'https://github.com/googlefonts/noto-emoji/blob/main/png/512/emoji_u{code}.png?raw=true'
+    # Noto Emoji's main branch no longer ships PNGs; v2.051 is the last release with png/512.
+    url = f'https://raw.githubusercontent.com/googlefonts/noto-emoji/v2.051/png/512/emoji_u{code}.png'
     # print(f'{url = }')
     return load_image(url, **kwargs)
 

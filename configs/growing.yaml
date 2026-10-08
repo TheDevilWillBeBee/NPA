@@ -18,6 +18,8 @@ npa:
     hidden_dims: 128
     eps0: 0.1
     alpha: 0.5
+    fused_perception: True
+    compile_step: True
 
 pool:
   pool_size: 512

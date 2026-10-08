@@ -2,7 +2,7 @@ import torch
 from dataclasses import dataclass
 from typing import Callable, Tuple, List, Any, Optional
 
-from sph import (
+from sphops import (
     blur,
     density,
     count,
@@ -12,12 +12,12 @@ from sph import (
     HashGrid,
     bin_particles,
 )
-from torch_sph import density as density_torch, blur as blur_torch
-from torch_sph import gradient as gradient_torch, count as count_torch
-from torch_sph import bin_particles as bin_particles_torch
-from torch_sph import density_gradient as density_gradient_torch
-from torch_sph import moment_matrix as moment_matrix_torch
-from utils import (
+from sphops.testing.torch_sph import density as density_torch, blur as blur_torch
+from sphops.testing.torch_sph import gradient as gradient_torch, count as count_torch
+from sphops.testing.torch_sph import bin_particles as bin_particles_torch
+from sphops.testing.torch_sph import density_gradient as density_gradient_torch
+from sphops.testing.torch_sph import moment_matrix as moment_matrix_torch
+from sphops.testing.utils import (
     relative_error,
     benchmark_function_forward,
     benchmark_function_backward,

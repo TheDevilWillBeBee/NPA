@@ -37,7 +37,10 @@ find_package(nanobind CONFIG REQUIRED)
 
 nanobind_add_module(sph_cuda sph_cuda.cu)
 
-set_property(TARGET sph_cuda PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+# One translation unit without device-side launches: whole-program device
+# compilation lets ptxas allocate registers without relocatable-code limits
+# (relocatable builds spill in the fused perception kernels).
+set_property(TARGET sph_cuda PROPERTY CUDA_SEPARABLE_COMPILATION OFF)
 
 target_compile_options(sph_cuda PRIVATE 
     $<$<COMPILE_LANGUAGE:CUDA>:-g>

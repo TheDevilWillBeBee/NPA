@@ -2,11 +2,9 @@
 
 import argparse
 import gc
-import importlib
 import itertools
 import os
 from pathlib import Path
-import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -17,12 +15,12 @@ import numpy as np
 from PIL import Image
 import torch
 
-from sphops.benchmark_data import build_cases, disk_positions, image_positions
+from sphops.testing.benchmark_data import build_cases, image_positions
 
 
 class CPUPerceptionTests(unittest.TestCase):
     def test_benchmark_permutation_preserves_particle_values_and_cotangents(self):
-        from sphops.benchmark import canonical_particles, binned_particles
+        from sphops.testing.benchmark import canonical_particles, binned_particles
         permutation = torch.tensor([[2, 0, 1]], dtype=torch.int32)
         values = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4).requires_grad_(True)
         binned, = binned_particles((values,), permutation)
@@ -33,13 +31,7 @@ class CPUPerceptionTests(unittest.TestCase):
         actual, = torch.autograd.grad(binned, values, binned_cotangent)
         torch.testing.assert_close(actual, cotangent, rtol=0, atol=0)
 
-    def test_package_and_standalone_imports_share_one_native_extension(self):
-        from sphops import sph
-        with patch.object(sys, "path", [str(Path(sph.__file__).parent), *sys.path]):
-            standalone = importlib.import_module("sph")
-        self.assertIs(standalone.sph_cuda, sph.sph_cuda)
-
-    def test_composite_perception_packing_and_optional_features(self):
+    def test_legacy_perception_packing_and_optional_features(self):
         from sphops import sph
         state = torch.arange(24, dtype=torch.float32).reshape(1, 3, 8)
         position = torch.zeros(1, 3, 2)
@@ -47,15 +39,18 @@ class CPUPerceptionTests(unittest.TestCase):
         density_gradient = torch.arange(6, dtype=torch.float32).reshape(1, 3, 2) / 10
         snapshot = SimpleNamespace(grid=SimpleNamespace(eps=0.1), dim=2, mode="grid")
         eps0 = torch.tensor([0.2])
+        # Omitted masses total N = 3; explicit masses divide by their own total.
+        masses = ((None, 3), (torch.tensor([[0.5, 1.0, 2.5]]), 4))
         with patch.object(sph, "density", return_value=torch.ones(1, 3)), \
              patch.object(sph, "blur", return_value=state * 2), \
              patch.object(sph, "gradient_hybrid", return_value=raw_gradient), \
              patch.object(sph, "density_gradient", return_value=density_gradient):
-            for state_grad, density_grad, log_grad, log_density in itertools.product((False, True), repeat=4):
+            for (mass, total_mass), state_grad, density_grad, log_grad, log_density in itertools.product(
+                    masses, *[(False, True)] * 4):
                 output = sph.perception(
-                    position, state, snapshot, eps0, state_grad=state_grad,
+                    position, state, snapshot, eps0, mass=mass, state_grad=state_grad,
                     density_grad=density_grad, log_norm_grad=log_grad,
-                    log_norm_density_grad=log_density, use_fused=False,
+                    log_norm_density_grad=log_density,
                 )
                 expected = [state, state * 2]
                 if state_grad:
@@ -64,7 +59,7 @@ class CPUPerceptionTests(unittest.TestCase):
                         value = torch.log(1 + value.norm(dim=-1, keepdim=True)) * torch.nn.functional.normalize(value, dim=-1)
                     expected.append(value.flatten(-2))
                 if density_grad:
-                    value = density_gradient * (0.5 ** 3) / 3
+                    value = density_gradient * (0.5 ** 3) / total_mass
                     if log_density:
                         value = torch.log(1 + value.norm(dim=-1, keepdim=True)) * torch.nn.functional.normalize(value, dim=-1)
                     expected.append(value)
@@ -72,64 +67,66 @@ class CPUPerceptionTests(unittest.TestCase):
 
     def test_cpu_inputs_are_not_reported_as_fused_supported(self):
         from sphops import fused_perception_supported
-        snapshot = SimpleNamespace(grid=SimpleNamespace(perception_forward=object()), mode="grid")
-        self.assertFalse(fused_perception_supported(torch.zeros(1, 3, 2), torch.zeros(1, 3, 16), snapshot))
+        grid = SimpleNamespace(mode="grid", hashgrid=SimpleNamespace(fused_perception_forward=object()))
+        self.assertFalse(fused_perception_supported(torch.zeros(1, 3, 2), torch.zeros(1, 3, 16), grid))
 
     def test_fused_channel_buckets_and_unsupported_sizes(self):
-        from sphops.sph import _fused_perception_channel_count
+        from sphops.sph import _native_channel_count
         for channels in range(1, 33):
             expected = 4 if channels <= 4 else 8 if channels <= 8 else 16 if channels <= 16 else 32
-            self.assertEqual(_fused_perception_channel_count(channels), expected)
+            self.assertEqual(_native_channel_count(channels), expected)
         for channels in (-1, 0, 33, 64):
-            self.assertIsNone(_fused_perception_channel_count(channels))
+            self.assertIsNone(_native_channel_count(channels))
 
-    def test_padded_perception_field_packing_and_autograd(self):
+    def test_fused_padding_field_packing_and_autograd(self):
         from sphops import sph
-        # Mock only the CUDA call: exercise real PyTorch padding, field slices,
-        # concatenation, and their adjoints for every logical channel count.
+        # Mock only the native function: exercise the real zero-padding, field
+        # slices, binned-state slice, concatenation, and their adjoints.
         for dim, channels, density_grad in itertools.product((2, 3), range(1, 33), (False, True)):
             with self.subTest(dim=dim, channels=channels, density_grad=density_grad):
-                state = torch.randn(1, 3, channels, requires_grad=True)
-                position = torch.zeros(1, 3, dim)
-                snapshot = SimpleNamespace(dim=dim, mode="grid")
+                B, N = 1, 3
+                state = torch.randn(B, N, channels, requires_grad=True)
+                position = torch.zeros(B, N, 2 if dim == 2 else 4)
+                grid = SimpleNamespace(dim=dim, mode="grid", num_cells=4,
+                                       hashgrid=SimpleNamespace(max_blocks=2))
                 captured = {}
-                def fake_native(x, padded, mass, snapshot, eps0, density_grad, *flags):
+                def fake_native(x, padded, mass, grid, eps0, density_grad, *flags):
+                    self.assertIsNone(mass)
                     padded.retain_grad()
-                    torch.testing.assert_close(mass, torch.ones_like(state[..., 0]), rtol=0, atol=0)
                     captured["state"] = padded
                     gradient = padded.unsqueeze(-1).expand(*padded.shape, dim) * 3
                     parts = [padded, padded * 2, gradient.flatten(-2)]
                     if density_grad:
-                        parts.append(torch.arange(dim, dtype=padded.dtype).expand(1, 3, dim) + 10)
+                        parts.append(torch.arange(dim, dtype=padded.dtype).expand(B, N, dim) + 10)
                     captured["output"] = torch.cat(parts, -1)
                     captured["output"].retain_grad()
-                    return captured["output"]
-                with patch.object(sph, "fused_perception_supported", return_value=True), \
-                     patch.object(sph.FusedPerception, "apply", side_effect=fake_native):
-                    output = sph.perception(position, state, snapshot, torch.tensor([0.1]),
-                                            density_grad=density_grad)
-                padded_channels = sph._fused_perception_channel_count(channels)
-                self.assertEqual(captured["state"].shape[-1], padded_channels)
+                    snapshot = torch.zeros(2 * 4 + B * 4 + 1 + B * N, dtype=torch.int32)
+                    return captured["output"], x * 1, padded * 1, snapshot
+                with patch.object(sph.FusedPerception, "apply", side_effect=fake_native):
+                    output, _, s_bin, snapshot = sph.fused_perception(
+                        position, state, grid, torch.tensor([0.1]), density_grad=density_grad)
+                native = sph._native_channel_count(channels)
+                self.assertEqual(captured["state"].shape[-1], native)
                 torch.testing.assert_close(captured["state"][..., :channels], state, rtol=0, atol=0)
                 self.assertEqual(int(torch.count_nonzero(captured["state"][..., channels:])), 0)
+                torch.testing.assert_close(s_bin, state, rtol=0, atol=0)
+                self.assertEqual(snapshot.permutation.shape, (B, N))
                 parts = [state, state * 2, (state.unsqueeze(-1).expand(*state.shape, dim) * 3).flatten(-2)]
                 if density_grad:
-                    parts.append(torch.arange(dim, dtype=state.dtype).expand(1, 3, dim) + 10)
+                    parts.append(torch.arange(dim, dtype=state.dtype).expand(B, N, dim) + 10)
                 expected = torch.cat(parts, -1)
                 torch.testing.assert_close(output, expected, rtol=0, atol=0)
-                self.assertTrue(output.is_contiguous())
-                if channels == padded_channels:
+                if channels == native:
                     self.assertIs(output, captured["output"])
-                cotangent = torch.randn_like(output)
-                expected_grad, = torch.autograd.grad(expected, state, cotangent)
-                output.backward(cotangent)
+                cotangent, state_cotangent = torch.randn_like(output), torch.randn_like(s_bin)
+                expected_grad, = torch.autograd.grad((expected, state), state, (cotangent, state_cotangent))
+                torch.autograd.backward((output, s_bin), (cotangent, state_cotangent))
                 torch.testing.assert_close(state.grad, expected_grad, rtol=1e-6, atol=1e-6)
-                if channels != padded_channels:
+                if channels != native:
                     self.assertEqual(int(torch.count_nonzero(captured["state"].grad[..., channels:])), 0)
                     native_grad = captured["output"].grad
-                    for begin, end in ((channels, padded_channels),
-                                       (padded_channels + channels, 2 * padded_channels),
-                                       (2 * padded_channels + channels * dim, padded_channels * (2 + dim))):
+                    for begin, end in ((channels, native), (native + channels, 2 * native),
+                                       (2 * native + channels * dim, native * (2 + dim))):
                         self.assertEqual(int(torch.count_nonzero(native_grad[..., begin:end])), 0)
 
     def test_fixed_mass_validation_and_legacy_argument_propagation(self):
@@ -148,7 +145,7 @@ class CPUPerceptionTests(unittest.TestCase):
              patch.object(sph, "blur", return_value=state) as blur, \
              patch.object(sph, "gradient_hybrid", return_value=torch.zeros(1, 3, 4, 2)) as gradient, \
              patch.object(sph, "density_gradient", return_value=x) as density_gradient:
-            sph.perception(x, state, snapshot, eps0, mass=mass, use_fused=False)
+            sph.perception(x, state, snapshot, eps0, mass=mass)
             for operation in (density, blur, gradient, density_gradient):
                 actual_mass = operation.call_args.kwargs["mass"]
                 self.assertTrue(actual_mass.is_contiguous())
@@ -292,12 +289,12 @@ class CUDAPerceptionTests(unittest.TestCase):
         if os.environ.get("NPA_RUN_CUDA_TESTS") != "1":
             raise unittest.SkipTest("CUDA checks require --gpu or NPA_RUN_CUDA_TESTS=1")
         from sphops.sph import sph_cuda
-        if not hasattr(sph_cuda.HashGrid2DBox, "perception_forward"):
+        if not hasattr(sph_cuda.HashGrid2DBox, "fused_perception_forward"):
             raise RuntimeError("Rebuild the CUDA extension or select a new build with NPA_SPH_EXTENSION_PATH before CUDA checks")
 
     def reference(self, x, s, grid, eps0, mass=None, density_grad=True,
                   log_norm_grad=True, log_norm_density_grad=True):
-        from sphops import torch_sph
+        from sphops.testing import torch_sph
         x = x[..., :grid.dim]
         periodic = grid.boundary == "periodic"
         length = [size * grid.eps for size in grid.grid_size] if periodic else None
@@ -315,14 +312,16 @@ class CUDAPerceptionTests(unittest.TestCase):
         parts = [s, blur, gradient.flatten(-2)]
         if density_grad:
             grad_rho = torch_sph.density_gradient(x, grid.eps, mass, periodic, length)
-            grad_rho = grad_rho * (grid.eps / eps0) ** (grid.dim + 1) / s.shape[1]
+            total_mass = s.shape[1] if mass is None else mass.reshape(s.shape[:2]).sum(dim=1)[:, None, None]
+            grad_rho = grad_rho * (grid.eps / eps0) ** (grid.dim + 1) / total_mass
             if log_norm_density_grad:
                 grad_rho = torch.log(1 + grad_rho.norm(dim=-1, keepdim=True)) * torch.nn.functional.normalize(grad_rho, dim=-1)
             parts.append(grad_rho)
         return torch.cat(parts, -1)
 
     def fixture(self, dim=2, channels=16, boundary="clamped", cap=32, size=8, dense=True):
-        from sphops import HashGrid, bin_particles
+        """Unbinned positions and states with their grid."""
+        from sphops import HashGrid
         generator = torch.Generator(device="cuda").manual_seed(42)
         x = torch.rand(2, 96, dim, generator=generator, device="cuda")
         x = (x - 0.5) * (0.3 if dense else size * 0.1)
@@ -331,27 +330,35 @@ class CUDAPerceptionTests(unittest.TestCase):
         state = torch.randn(2, 96, channels, generator=generator, device="cuda") * 0.1
         grid = HashGrid(dim=dim, boundary=boundary, mode="grid", grid_size=[size] * dim,
                         eps=0.1, num_particles=96, batch_size=2, max_particles_per_block=cap)
-        snapshot = grid.instantiate(x)
-        x, state = bin_particles(x, state, snapshot)
-        torch.cuda.synchronize()
-        return x, state, grid, snapshot
+        return x, state, grid
 
-    def compare(self, x, state, grid, snapshot, **flags):
-        from sphops import perception
-        from sphops.benchmark import cached_state_adjoint_reference, fused_perception_context
+    def bin_like(self, x, state, snapshot, mass=None):
+        """Differentiably bin original-order inputs with a fused call's snapshot."""
+        from sphops import bin_particles
+        if mass is None:
+            _, s_bin = bin_particles(x, state, snapshot)
+            return s_bin, None
+        _, s_bin, mass_bin = bin_particles(x, state, snapshot, mass=mass.reshape(x.shape[:2]).contiguous())
+        return s_bin, mass_bin
+
+    def compare(self, x, state, grid, **flags):
+        from sphops import fused_perception
+        from sphops.testing.benchmark import cached_state_adjoint_reference, fused_perception_context
         eps0 = torch.tensor([grid.eps / 0.7], device="cuda")
         state = state.detach().requires_grad_(True)
-        reference_state = state.detach().clone().requires_grad_(True)
-        output = perception(x, state, snapshot, eps0, **flags)
-        native_context = fused_perception_context(output)
-        self.assertEqual(native_context.state_shape[-1], next(
+        output, x_bin, s_bin, snapshot = fused_perception(x, state, grid, eps0, **flags)
+        self.assertEqual(fused_perception_context(output).channels, next(
             count for count in (4, 8, 16, 32) if state.shape[-1] <= count))
-        expected = self.reference(x, reference_state, grid, eps0, **flags)
+        reference_state = state.detach().clone().requires_grad_(True)
+        reference_s_bin, mass_bin = self.bin_like(x, reference_state, snapshot, flags.get("mass"))
+        torch.testing.assert_close(s_bin, reference_s_bin, rtol=0, atol=0)
+        reference_flags = {key: value for key, value in flags.items() if key != "mass"}
+        expected = self.reference(x_bin.detach(), reference_s_bin, grid, eps0, mass=mass_bin, **reference_flags)
         torch.testing.assert_close(output, expected, rtol=3e-4, atol=4e-5)
         generator = torch.Generator(device=state.device).manual_seed(71)
         cotangent = torch.randn(output.shape, device=state.device, generator=generator)
         cached_reference_grad = cached_state_adjoint_reference(
-            torch, x, state, snapshot, eps0, output, cotangent, mass=flags.get("mass"))
+            torch, x, state, output, snapshot, eps0, cotangent, mass=flags.get("mass"))
         actual_grad, = torch.autograd.grad(output, state, cotangent)
         expected_grad, = torch.autograd.grad(expected, reference_state, cotangent)
         # Strictly verify the derivative independently at identical cached
@@ -360,7 +367,7 @@ class CUDAPerceptionTests(unittest.TestCase):
         try:
             torch.testing.assert_close(actual_grad, expected_grad, rtol=4e-4, atol=5e-5)
         except AssertionError:
-            if not native_context.log_norm_grad:
+            if not flags.get("log_norm_grad", True):
                 raise
             # Float32's rounded (1+norm) can give different Jacobians for
             # roundoff-close forward values. Do not relax the cached-point
@@ -384,10 +391,11 @@ class CUDAPerceptionTests(unittest.TestCase):
                 self.compare(*fixture, mass=mass)
 
     def test_nonunit_mass_flags_layouts_and_global_scaling(self):
-        from sphops import perception
+        from sphops import fused_perception
+        from sphops.testing.benchmark import canonical_particles
         for dim, channels in itertools.product((2, 3), (4, 5, 17)):
             fixture = self.fixture(dim=dim, channels=channels)
-            x, state, grid, snapshot = fixture
+            x, state, grid = fixture
             generator = torch.Generator(device="cuda").manual_seed(94)
             mass = 0.3 + torch.rand(2, 96, 2, generator=generator, device="cuda")
             mass = mass[..., :1]  # [B,N,1] and noncontiguous.
@@ -399,15 +407,18 @@ class CUDAPerceptionTests(unittest.TestCase):
             for constant in (1.0 / 96, 0.1, 2.0):
                 with self.subTest(dim=dim, channels=channels, constant_mass=constant):
                     self.compare(*fixture, mass=torch.full((2, 96), constant, device="cuda"))
-            # Uniform rescaling leaves m/rho and all state features unchanged,
-            # but scales the raw density-gradient feature before log normalization.
+            # Uniform rescaling leaves m/rho, all state features, and the
+            # total-mass-normalized density gradient unchanged.
+            # Each call bins independently: compare in original particle order.
             with torch.no_grad():
                 eps0 = torch.tensor([grid.eps], device="cuda")
-                first = perception(x, state, snapshot, eps0, mass=mass, log_norm_density_grad=False)
-                scaled = perception(x, state, snapshot, eps0, mass=mass * 3, log_norm_density_grad=False)
-                split = channels * (2 + dim)
-                torch.testing.assert_close(first[..., :split], scaled[..., :split], rtol=3e-4, atol=4e-5)
-                torch.testing.assert_close(first[..., split:] * 3, scaled[..., split:], rtol=3e-4, atol=4e-5)
+                outputs = []
+                for scale in (1, 3):
+                    z, _, _, snapshot = fused_perception(x, state, grid, eps0, mass=mass * scale,
+                                                         log_norm_density_grad=False)
+                    outputs.append(canonical_particles((z,), snapshot.permutation)[0])
+                first, scaled = outputs
+                torch.testing.assert_close(first, scaled, rtol=3e-4, atol=4e-5)
 
     def test_normalization_flags_and_zero_state(self):
         for channels in (1, 4, 5, 16, 17):
@@ -417,41 +428,44 @@ class CUDAPerceptionTests(unittest.TestCase):
                                   log_norm_density_grad=log_norm_density_grad):
                     self.compare(*fixture, density_grad=density_grad, log_norm_grad=log_norm_grad,
                                  log_norm_density_grad=log_norm_density_grad)
-            x, state, grid, snapshot = fixture
-            self.compare(x, torch.zeros_like(state), grid, snapshot)
-            self.compare(x, torch.ones_like(state), grid, snapshot)
+            x, state, grid = fixture
+            self.compare(x, torch.zeros_like(state), grid)
+            self.compare(x, torch.ones_like(state), grid)
 
-    def test_padded_inference_and_oversize_fallback(self):
-        from sphops import fused_perception_supported, perception
+    def test_padded_inference_and_oversize_support(self):
+        from sphops import bin_particles, fused_perception, fused_perception_supported, perception
         for channels in (1, 4, 5, 17, 33):
             with self.subTest(channels=channels):
-                x, state, grid, snapshot = self.fixture(channels=channels)
-                self.assertEqual(fused_perception_supported(x, state, snapshot), channels <= 32)
+                x, state, grid = self.fixture(channels=channels)
+                self.assertEqual(fused_perception_supported(x, state, grid), channels <= 32)
+                if channels > 32:
+                    continue
                 eps0 = torch.tensor([grid.eps], device="cuda")
                 with torch.no_grad():
-                    actual = perception(x, state, snapshot, eps0)
-                    expected = perception(x, state, snapshot, eps0, use_fused=False)
+                    actual, x_bin, s_bin, snapshot = fused_perception(x, state, grid, eps0)
+                    _, legacy_state = bin_particles(x, state, snapshot)
+                    expected = perception(x_bin, legacy_state, snapshot, eps0)
                 self.assertIsNone(actual.grad_fn)
                 torch.testing.assert_close(actual, expected, rtol=3e-4, atol=4e-5)
 
     def test_tiny_state_gradients_preserve_normalization_backward_accuracy(self):
         for channels in (1, 4, 5, 16, 17):
-            x, state, grid, snapshot = self.fixture(channels=channels)
+            x, state, grid = self.fixture(channels=channels)
             for scale in (1e-4, 1e-5, 1e-7):
                 with self.subTest(channels=channels, state_scale=scale):
-                    self.compare(x, state * scale, grid, snapshot)
+                    self.compare(x, state * scale, grid)
 
     def test_backward_releases_snapshot_and_grid_owners(self):
         if self.instrumented:
             raise unittest.SkipTest("CUDA instrumentation retains Python allocation/call frames; checked without instrumentation")
-        from sphops import perception
+        from sphops import fused_perception
         def iteration(channels):
-            x, state, grid, snapshot = self.fixture(channels=channels)
+            x, state, grid = self.fixture(channels=channels)
             state.requires_grad_(True)
-            output = perception(x, state, snapshot, torch.tensor([grid.eps], device="cuda"))
-            torch.autograd.grad(output, state, torch.ones_like(output))
+            output, _, s_bin, snapshot = fused_perception(x, state, grid, torch.tensor([grid.eps], device="cuda"))
+            torch.autograd.grad((output.sum(), s_bin.sum()), state)
             return weakref.ref(grid), weakref.ref(snapshot)
-        references = [iteration(channels) for channels in (1, 4, 5, 16, 17) for _ in range(4)]
+        references = [iteration(channels) for channels in (1, 4, 5, 16, 17, 32) for _ in range(3)]
         torch.cuda.synchronize()
         gc.collect()
         for grid_ref, snapshot_ref in references:
@@ -459,28 +473,23 @@ class CUDAPerceptionTests(unittest.TestCase):
             self.assertIsNone(snapshot_ref())
 
     def test_periodic_seams_outside_box_and_non_power_of_two_grid(self):
-        from sphops import bin_particles
-        x, state, grid, _ = self.fixture(boundary="periodic", size=10, dense=False)
+        x, state, grid = self.fixture(boundary="periodic", size=10, dense=False)
         x = x.clone()
         x[:, :2, 0] = torch.tensor([-0.499, 0.499], device="cuda")
         x[:, :2, 1] = 0
         x[:, 2:10] += torch.tensor([2.0, -3.0], device="cuda")
-        snapshot = grid.instantiate(x)
-        x, state = bin_particles(x, state, snapshot)
-        self.compare(x, state, grid, snapshot)
+        self.compare(x, state, grid)
 
     def test_duplicate_and_isolated_positions_with_singular_moment_matrices(self):
-        from sphops import HashGrid, bin_particles
+        from sphops import HashGrid
         x = torch.tensor([[[-0.4, -0.4], [-0.4, -0.4], [0.4, 0.4]]], device="cuda")
         state = torch.randn(1, 3, 16, device="cuda")
         grid = HashGrid(dim=2, boundary="clamped", mode="grid", grid_size=[10, 10],
                         eps=0.1, num_particles=3, batch_size=1, max_particles_per_block=32)
-        snapshot = grid.instantiate(x)
-        x, state = bin_particles(x, state, snapshot)
-        self.compare(x, state, grid, snapshot)
+        self.compare(x, state, grid)
 
     def test_saved_snapshot_survives_later_grid_initializations(self):
-        from sphops import HashGrid, bin_particles, blur, density, perception
+        from sphops import HashGrid, bin_particles, blur, density, fused_perception
         axis = (torch.arange(16, device="cuda", dtype=torch.float32) - 8 + 0.5) * 0.1
         sparse = torch.stack(torch.meshgrid(axis, axis, indexing="ij"), -1).reshape(1, 256, 2).repeat_interleave(2, 1)
         state = torch.randn(1, 512, 16, device="cuda", requires_grad=True)
@@ -491,7 +500,7 @@ class CUDAPerceptionTests(unittest.TestCase):
         rho = density(x, snapshot)
         blur_output = blur(x, rho, s, snapshot)
         eps0 = torch.tensor([0.1], device="cuda")
-        fused = perception(x, s, snapshot, eps0)
+        fused, _, _, _ = fused_perception(sparse, state, grid, eps0)
         blur_cotangent, cotangent = torch.randn_like(blur_output), torch.randn_like(fused)
         before_blur, = torch.autograd.grad(blur_output, state, blur_cotangent, retain_graph=True)
         before, = torch.autograd.grad(fused, state, cotangent, retain_graph=True)
@@ -502,39 +511,103 @@ class CUDAPerceptionTests(unittest.TestCase):
         torch.testing.assert_close(after, before, rtol=0, atol=0)
         torch.testing.assert_close(density(x, snapshot), rho, rtol=0, atol=0)
 
-    def test_fallback_retains_full_position_and_density_backward(self):
-        from sphops import fused_perception_supported, perception
-        x, state, grid, snapshot = self.fixture(channels=12)
+    def test_legacy_perception_keeps_full_position_and_density_backward(self):
+        # Position gradients of perception use the standalone operators (NPA
+        # selects them when stopgrad_pos=False).
+        from sphops import bin_particles, perception
+        x, state, grid = self.fixture(channels=12)
+        snapshot = grid.instantiate(x)
+        x, state = bin_particles(x, state, snapshot)
         x = x.detach().requires_grad_(True)
         state = state.detach().requires_grad_(True)
         eps0 = torch.tensor([grid.eps], device="cuda")
         mass = torch.linspace(0.3, 1.7, 96, device="cuda").expand(2, 96).contiguous()
-        self.assertFalse(fused_perception_supported(x, state, snapshot, mass))
         actual = perception(x, state, snapshot, eps0, mass=mass)
-        legacy = perception(x, state, snapshot, eps0, mass=mass, use_fused=False)
         expected = self.reference(x, state, grid, eps0, mass=mass)
-        torch.testing.assert_close(actual, legacy, rtol=0, atol=0)
         torch.testing.assert_close(actual, expected, rtol=3e-4, atol=4e-5)
         for seed in range(8):
             with self.subTest(cotangent_seed=seed):
                 generator = torch.Generator(device="cuda").manual_seed(seed)
                 cotangent = torch.randn(actual.shape, device="cuda", generator=generator)
                 actual_grads = torch.autograd.grad(actual, (x, state), cotangent, retain_graph=True)
-                legacy_grads = torch.autograd.grad(legacy, (x, state), cotangent, retain_graph=True)
                 expected_grads = torch.autograd.grad(expected, (x, state), cotangent, retain_graph=True)
-                for index, (a, old, b) in enumerate(zip(actual_grads, legacy_grads, expected_grads)):
-                    # Exact legacy dispatch, allowing its atomic accumulation
-                    # ordering; keep a strict pointwise state-adjoint check.
-                    torch.testing.assert_close(a, old, rtol=5e-4, atol=1e-4 if index == 0 else 5e-5)
-                    if index == 1:
-                        torch.testing.assert_close(a, b, rtol=5e-4, atol=5e-5)
-                    else:
-                        # Position gradients have large canceling terms. The
-                        # dense float32 reference differs by <5e-7 relative L2
-                        # on these eight cotangents, but a near-zero component
-                        # can fail an absolute 1e-4 pointwise test.
-                        relative_error = (a - b).norm() / b.norm().clamp_min(1e-12)
-                        self.assertLessEqual(float(relative_error), 3e-6)
+                torch.testing.assert_close(actual_grads[1], expected_grads[1], rtol=5e-4, atol=5e-5)
+                # Position gradients have large canceling terms. The dense
+                # float32 reference differs by <5e-7 relative L2 on these eight
+                # cotangents, but a near-zero component can fail an absolute
+                # 1e-4 pointwise test.
+                relative_error = (actual_grads[0] - expected_grads[0]).norm() / expected_grads[0].norm().clamp_min(1e-12)
+                self.assertLessEqual(float(relative_error), 3e-6)
+
+    def test_fused_matches_legacy_operators_on_its_snapshot(self):
+        # The fused call's binning outputs and accumulated gradients against
+        # bin_particles + perception on the same (atomically ordered) snapshot.
+        # The state gradient is not log-normalized here, so the comparison is
+        # pointwise; compare() covers normalization.
+        from sphops import bin_particles, fused_perception, perception
+        flags = dict(density_grad=True, log_norm_grad=False, log_norm_density_grad=True)
+        cases = itertools.product((2, 3), ("clamped", "periodic"), (4, 5, 32), (16, 64),
+                                  (False, True), (True, False), (False, True))
+        for index, (dim, boundary, channels, cap, nonunit, perceive_state, position_grad) in enumerate(cases):
+            with self.subTest(dim=dim, boundary=boundary, channels=channels, cap=cap, nonunit=nonunit,
+                              perceive_state=perceive_state, position_grad=position_grad):
+                x, s, grid = self.fixture(dim, channels, boundary, cap)
+                generator = torch.Generator(device="cuda").manual_seed(index)
+                mass = 0.4 + torch.rand(2, 96, 1, generator=generator, device="cuda") if nonunit else None
+                eps0 = torch.tensor([grid.eps / 0.7], device="cuda")
+                xa, sa = x.clone().requires_grad_(position_grad), s.clone().requires_grad_(True)
+                z, x_bin, s_bin, snapshot = fused_perception(
+                    xa, sa, grid, eps0, mass=mass, perceive_state=perceive_state, **flags)
+                xb, sb = x.clone().requires_grad_(position_grad), s.clone().requires_grad_(True)
+                if mass is None:
+                    xb_bin, sb_bin = bin_particles(xb, sb, snapshot)
+                    mass_bin = None
+                else:
+                    xb_bin, sb_bin, mass_bin = bin_particles(xb, sb, snapshot, mass=mass)
+                zb = perception(xb_bin.detach(), sb_bin if perceive_state else sb_bin.detach(),
+                                snapshot, eps0, mass=mass_bin, **flags)
+                torch.testing.assert_close(x_bin, xb_bin, rtol=0, atol=0)
+                torch.testing.assert_close(s_bin, sb_bin, rtol=0, atol=0)
+                torch.testing.assert_close(z, zb, rtol=3e-4, atol=4e-5)
+                self.assertEqual(z.requires_grad, zb.requires_grad)
+                cotangents = [torch.randn(t.shape, generator=generator, device="cuda") for t in (z, x_bin, s_bin)]
+                def loss(outputs):
+                    return sum((o * c).sum() for o, c in zip(outputs, cotangents))
+                inputs_a, inputs_b = ((xa, sa), (xb, sb)) if position_grad else ((sa,), (sb,))
+                actual = torch.autograd.grad(loss((z, x_bin, s_bin)), inputs_a, retain_graph=True)
+                expected = torch.autograd.grad(loss((zb, xb_bin, sb_bin)), inputs_b)
+                if position_grad:
+                    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+                torch.testing.assert_close(actual[-1], expected[-1], rtol=4e-4, atol=5e-5)
+                if perceive_state:
+                    # Backward adds the binned-state cotangent to the perception
+                    # adjoint in one pass: exactly the sum of the separate terms.
+                    from_z, = torch.autograd.grad((z * cotangents[0]).sum(), sa, retain_graph=True)
+                    from_s, = torch.autograd.grad((s_bin * cotangents[2]).sum(), sa)
+                    torch.testing.assert_close(actual[-1], from_z + from_s, rtol=0, atol=0)
+
+    def test_npa_dispatches_fused_path_only_when_supported(self):
+        from models.npa import NPA
+        from sphops import HashGrid
+        from sphops.testing.benchmark import fused_perception_context
+        for channels, kwargs, fused in ((16, {}, True), (5, {}, True), (33, {}, False),
+                                        (16, dict(stopgrad_pos=False), False),
+                                        (16, dict(fused_perception=False), False)):
+            with self.subTest(channels=channels, **kwargs):
+                model = NPA(state_dims=channels, hidden_dims=32, **kwargs).cuda()
+                grid = HashGrid(dim=2, boundary="clamped", mode="grid", grid_size=[16, 16], eps=0.1,
+                                num_particles=96, batch_size=2, max_particles_per_block=32)
+                x = torch.randn(2, 96, 2, device="cuda") * 0.1
+                s = (torch.randn(2, 96, channels, device="cuda") * 0.1).requires_grad_(True)
+                z, _, _, snapshot = model.perceive(x, s, grid)
+                try:
+                    fused_perception_context(z)
+                    found = True
+                except RuntimeError:
+                    found = False
+                self.assertEqual(found, fused)
+                self.assertEqual(z.shape[-1], model.perception_dim)
+                self.assertEqual(snapshot.permutation.shape, (2, 96))
 
     def test_multi_step_npa_parameter_and_state_gradients(self):
         for channels in (1, 4, 5, 16, 17):

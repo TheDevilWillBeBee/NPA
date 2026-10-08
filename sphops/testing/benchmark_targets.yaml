@@ -1,6 +1,6 @@
 # Paths are relative to asset_root, itself relative to this manifest.
 # These defaults use existing local caches; the benchmark never downloads assets.
-asset_root: ..
+asset_root: ../..
 
 emoji_targets:
   - name: emoji_lizard

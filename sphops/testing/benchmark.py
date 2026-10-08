@@ -17,10 +17,7 @@ import threading
 
 import numpy as np
 
-if __package__:
-    from .benchmark_data import build_cases, neighbor_statistics
-else:
-    from benchmark_data import build_cases, neighbor_statistics
+from .benchmark_data import build_cases, neighbor_statistics
 
 
 class GPUQuietGuard:
@@ -142,7 +139,7 @@ def numerical_difference(actual, expected):
 
 
 def fused_perception_context(output):
-    """Find the native context underneath differentiable padding/unpacking."""
+    """Find the FusedPerception autograd node underneath padding/unpacking."""
     pending, visited = [output.grad_fn], set()
     while pending:
         node = pending.pop()
@@ -155,32 +152,51 @@ def fused_perception_context(output):
     raise RuntimeError("No fused perception context found; cannot validate its cached adjoint")
 
 
-def cached_state_adjoint_reference(torch, x, state, snapshot, eps0, output, cotangent, mass=None):
+def fused_saved_state(context):
+    """Binned positions (detached), volumes, and pre-normalization corrected
+    gradients saved by FusedPerception (mirrors fused_workspace_layout in sph_cuda.cu)."""
+    x_bin, workspace, _, _ = context.saved_tensors
+    x_bin = x_bin.detach()
+    B, N = x_bin.shape[:2]
+    particles, dim, channels = B * N, context.grid.dim, context.channels
+    volume = workspace[:particles].view(B, N)
+    offset = particles * (1 + (dim if context.density_grad else 0) + dim)
+    corrected = (workspace[offset:offset + particles * channels * dim].view(B, N, channels, dim)
+                 if context.log_norm_grad else None)
+    return x_bin, volume, corrected
+
+
+def cached_state_adjoint_reference(torch, x, state, output, snapshot, eps0, cotangent, mass=None):
     """Independent legacy SPH/PyTorch adjoint at the fused normalization point.
 
     log(1 + norm) rounds its addition before the log. A few ulps in a small
     SPH gradient can cross that boundary and change the normalization Jacobian.
     Hold the forward values fixed, not the Jacobian: legacy SPH backward and
     PyTorch autograd still compute the complete state derivative independently.
+    x, state, and mass are in original particle order; output and cotangent
+    are fused_perception's (binned) output and its cotangent.
     """
-    from sphops import blur, gradient
+    from sphops import bin_particles, blur, gradient
     from sphops.sph import _log_normalize_gradient
     context = fused_perception_context(output)
-    _, volume, corrected_values, _, _ = context.saved_tensors
-    from sphops.sph import _default_mass
-    mass = _default_mass(x, mass).contiguous()
-    rho = (mass / volume).detach()
-    raw = gradient(x, rho, state, snapshot, mass=mass) * (snapshot.grid.eps / eps0)
+    x_bin, volume, corrected_values = fused_saved_state(context)
+    # Bin exactly as the fused call did (same snapshot), differentiably in state.
+    if mass is None:
+        _, s_bin = bin_particles(x, state, snapshot)
+        mass_bin = torch.ones_like(volume)
+    else:
+        _, s_bin, mass_bin = bin_particles(x, state, snapshot, mass=mass.reshape(x.shape[:2]).contiguous())
+    rho = (mass_bin / volume).detach()
+    raw = gradient(x_bin, rho, s_bin, snapshot, mass=mass_bin) * (snapshot.grid.eps / eps0)
     # Evaluate at exactly the cached values, with the original straight-through
     # identity derivative to raw SPH (including the radius scale).
+    channels = state.shape[-1]
     if context.log_norm_grad:
-        corrected_values = corrected_values[..., :state.shape[-1], :]
-        aligned = (raw - raw.detach()) + corrected_values.detach()
+        aligned = (raw - raw.detach()) + corrected_values[..., :channels, :].detach()
         gradient = _log_normalize_gradient(aligned)
     else:
         gradient = raw
-    channels = state.shape[-1]
-    parts = [state, blur(x, rho, state, snapshot, mass=mass), gradient.flatten(-2)]
+    parts = [s_bin, blur(x_bin, rho, s_bin, snapshot, mass=mass_bin), gradient.flatten(-2)]
     parts.append(output[..., channels * (2 + snapshot.dim):].detach())
     reference = torch.cat(parts, dim=-1)
     return torch.autograd.grad(reference, state, cotangent)[0]
@@ -190,7 +206,8 @@ def make_workloads(torch, case, cap, channels, hidden_dims, operations, variants
                    mass_range=(1.0, 1.0)):
     # Import only for an explicitly requested GPU run. Tensor setup is untimed.
     from sphops import HashGrid, bin_particles, density, blur, gradient
-    from sphops import density_gradient, moment_matrix, perception, fused_perception_supported
+    from sphops import density_gradient, moment_matrix, perception
+    from sphops import fused_perception, fused_perception_supported
     from models.npa import NPA
 
     B, N, _ = case.positions.shape
@@ -210,53 +227,64 @@ def make_workloads(torch, case, cap, channels, hidden_dims, operations, variants
     snapshot = grid.instantiate(x)
     x_bin, s_bin, mass_bin = bin_particles(x, state, snapshot, mass=mass)
     eps0 = torch.tensor([case.eps], device=device)
-    if "fused" in variants and not fused_perception_supported(x_bin, s_bin, snapshot, mass_bin):
+    if "fused" in variants and not fused_perception_supported(x, state, grid, mass):
         raise RuntimeError("Fused kernels unavailable; rebuild the CUDA extension or set NPA_SPH_EXTENSION_PATH to a new build")
     workloads = {}
     validation = {}
     if "perception" in operations:
-        reference_output, reference_gradient = None, None
+        # Both variants start from unbinned particles: fused_perception versus
+        # instantiate + bin_particles + perception. Each bins independently, so
+        # outputs are compared in original particle order, and one cotangent in
+        # original order is mapped to each variant's bin order.
+        cotangent, reference = None, None
         for variant in variants:
-            s = s_bin.detach().requires_grad_(True)
-            fused = variant == "fused"
-            def forward(s=s, fused=fused):
-                return perception(x_bin, s, snapshot, eps0, mass=mass_bin, use_fused=fused)
-            output = forward()
-            cotangent = torch.randn(output.shape, generator=generator, device=device)
-            # Reuse exactly the same incoming gradient across variants.
-            if variant == variants[0]:
-                perception_cotangent = cotangent
-            def backward(output=output, s=s, cotangent=perception_cotangent):
+            s = state.detach().requires_grad_(True)
+            if variant == "fused":
+                def forward(s=s):
+                    z, _, _, binned = fused_perception(x, s, grid, eps0, mass=mass)
+                    return z, binned
+            else:
+                def forward(s=s):
+                    binned = grid.instantiate(x)
+                    x_binned, s_binned, mass_binned = bin_particles(x, s, binned, mass=mass)
+                    return perception(x_binned, s_binned, binned, eps0, mass=mass_binned), binned
+            output, output_snapshot = forward()
+            canonical_output, = canonical_particles((output,), output_snapshot.permutation)
+            # One draw per variant keeps the generator sequence (and so the NPA
+            # fixtures below) of earlier versions; all variants use the first.
+            drawn = torch.randn(output.shape, generator=generator, device=device)
+            if cotangent is None:
+                cotangent = drawn
+            binned_cotangent, = binned_particles((cotangent,), output_snapshot.permutation)
+            def backward(output=output, s=s, cotangent=binned_cotangent):
                 return torch.autograd.grad(output, s, cotangent, retain_graph=True)
-            if fused:
+            gradient_value = backward()[0]
+            if variant == "fused":
                 cached_reference_gradient = cached_state_adjoint_reference(
-                    torch, x_bin, s, snapshot, eps0, output, perception_cotangent, mass=mass_bin)
-                fused_gradient = backward()[0]
-                torch.testing.assert_close(fused_gradient, cached_reference_gradient, rtol=5e-4, atol=2e-4)
+                    torch, x, s, output, output_snapshot, eps0, binned_cotangent, mass=mass)
+                torch.testing.assert_close(gradient_value, cached_reference_gradient, rtol=5e-4, atol=2e-4)
                 validation[("perception", variant)] = {
                     "logical_channels": channels,
-                    "native_channels": fused_perception_context(output).state_shape[-1],
+                    "native_channels": fused_perception_context(output).channels,
                     "padding_and_unpacking_included": True,
-                    "cached_state_adjoint": numerical_difference(fused_gradient, cached_reference_gradient),
+                    "cached_state_adjoint": numerical_difference(gradient_value, cached_reference_gradient),
                     "cached_state_adjoint_tolerance": {"rtol": 5e-4, "atol": 2e-4},
                 }
-            if reference_output is None:
-                reference_output = output.detach()
-                reference_gradient = backward()[0]
+            if reference is None:
+                reference = (canonical_output.detach(), gradient_value)
             else:
-                torch.testing.assert_close(output.detach(), reference_output, rtol=5e-4, atol=5e-5)
-                actual_gradient = backward()[0]
+                torch.testing.assert_close(canonical_output.detach(), reference[0], rtol=5e-4, atol=5e-5)
                 # Pointwise derivative correctness is checked independently at
                 # identical cached values above. Also bound overall agreement
                 # with the unmodified legacy normalization evaluation point.
-                gradient_difference = numerical_difference(actual_gradient, reference_gradient)
+                gradient_difference = numerical_difference(gradient_value, reference[1])
                 if gradient_difference["relative_l2_error"] > 1e-5:
                     raise AssertionError(f"SPH state-adjoint relative L2 error exceeds 1e-5: {gradient_difference}")
-                pointwise_mismatches = int(((actual_gradient - reference_gradient).abs()
-                                            > 2e-4 + 5e-4 * reference_gradient.abs()).sum())
+                pointwise_mismatches = int(((gradient_value - reference[1]).abs()
+                                            > 2e-4 + 5e-4 * reference[1].abs()).sum())
                 validation.setdefault(("perception", variant), {}).update({
                     "reference_variant": variants[0],
-                    "output": numerical_difference(output, reference_output),
+                    "output": numerical_difference(canonical_output, reference[0]),
                     "state_gradient": gradient_difference,
                     "state_gradient_relative_l2_limit": 1e-5,
                     "original_normalization_pointwise_mismatches": pointwise_mismatches,
