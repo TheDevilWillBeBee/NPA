@@ -50,7 +50,6 @@ class CUDAKernelValidator:
         self,
         grid_size,
         boundary,
-        mode,
         B: int,
         N: int,
         C: int,
@@ -78,7 +77,6 @@ class CUDAKernelValidator:
         self.seed = seed
         self.grid_size = grid_size
         self.boundary = boundary
-        self.mode = mode  # "ParticleBased" or "GridBased"
         self.periodic = str(boundary).lower() == "periodic"
         if isinstance(grid_size, (list, tuple)):
             self.box_size = [g * self.eps for g in grid_size]
@@ -110,7 +108,7 @@ class CUDAKernelValidator:
             if self.rand_type == "randn":
                 self.x = (
                     torch.randn(
-                        self.B, self.N, 2 if self.dim == 2 else 4, device=self.device
+                        self.B, self.N, self.dim, device=self.device
                     )
                     * self.sigma
                 )
@@ -120,7 +118,7 @@ class CUDAKernelValidator:
                         torch.rand(
                             self.B,
                             self.N,
-                            2 if self.dim == 2 else 4,
+                            self.dim,
                             device=self.device,
                         )
                         - 0.5
@@ -139,7 +137,6 @@ class CUDAKernelValidator:
                 boundary=self.boundary,
                 # boundary="clamped",
                 
-                mode=self.mode,
                 grid_size=[self.grid_size] * self.dim,
                 eps=self.eps,
                 num_particles=self.N,
@@ -474,7 +471,7 @@ class CUDAKernelValidator:
         print(
             f"Config: B={self.B}, N={self.N}, C={self.C}, dim={self.dim}, "
             f"eps={self.eps}, sigma={self.sigma}, \n"
-            f"grid_size={self.grid_size}, boundary={self.boundary}, mode={self.mode}, "
+            f"grid_size={self.grid_size}, boundary={self.boundary}, "
             f"max_particles_per_block={self.max_particles_per_block}"
         )
         print(
@@ -595,36 +592,31 @@ class CUDAKernelValidator:
 def main():
     """Main entry point"""
     for boundary in ["clamped", "periodic"]:
-        for mode in ["particle", "grid"]:
-            print(f"\nTesting with boundary={boundary}, mode={mode}")
+        print(f"\nTesting with boundary={boundary}")
 
+        validator = CUDAKernelValidator(
+            grid_size=16,
+            # boundary="clamped",
+            boundary=boundary,
+            B=3,
+            N=256,
+            C=16,
+            dim=2,
+            # eps=0.1,
+            eps=0.1,
 
-            validator = CUDAKernelValidator(
-                grid_size=16,
-                # boundary="clamped",
-                boundary=boundary,
-                
-                # mode="grid",
-                mode=mode,
-                B=3,
-                N=256,
-                C=16,
-                dim=2,
-                # eps=0.1,
-                eps=0.1,
-                
-                sigma=1.0,
-                # sigma=0.2,
-                
-                max_particles_per_block=64,
-                rand_type="rand",
-                device="cuda:0",
-                num_benchmark_runs=64,
-                warmup_runs=16,
-                seed=42,  # Set to None for non-reproducible random data
-            )
+            sigma=1.0,
+            # sigma=0.2,
 
-            validator.run_all(True)
+            max_particles_per_block=64,
+            rand_type="rand",
+            device="cuda:0",
+            num_benchmark_runs=64,
+            warmup_runs=16,
+            seed=42,  # Set to None for non-reproducible random data
+        )
+
+        validator.run_all(True)
 
 
 if __name__ == "__main__":

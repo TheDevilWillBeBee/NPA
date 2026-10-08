@@ -1,0 +1,859 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>NPA Kernel Optimization Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap">
+<style>
+/* Layout: engineering notebook. Sticky contents rail + one reading column; code, tables, and diagrams scroll inside their own boxes. */
+:root {
+  --paper: #f4f6f3;
+  --ink: #1b2422;
+  --muted: #5a6763;
+  --rule: #d6ddd8;
+  --rule-strong: #9fb0a9;
+  --code-bg: #e9eeea;
+  --tint: #e3eee9;
+  --accent: #0b7366;      /* "after": the change we made */
+  --accent-soft: #a9d9cf;
+  --warm: #b4581f;        /* "before": cost, idle, removed */
+  --warm-soft: #f0c9ac;
+  --tile: #d3dbd6;
+  --on-accent: #ffffff;
+  --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #111614; --ink: #e1e8e4; --muted: #98a6a0; --rule: #27322e; --rule-strong: #4d5d57;
+    --code-bg: #182120; --tint: #16271f; --accent: #4fc6b2; --accent-soft: #1f5b51;
+    --warm: #ec9a5f; --warm-soft: #6b3a1c; --tile: #2a3531; --on-accent: #0b1513;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #111614; --ink: #e1e8e4; --muted: #98a6a0; --rule: #27322e; --rule-strong: #4d5d57;
+  --code-bg: #182120; --tint: #16271f; --accent: #4fc6b2; --accent-soft: #1f5b51;
+  --warm: #ec9a5f; --warm-soft: #6b3a1c; --tile: #2a3531; --on-accent: #0b1513;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 17px/1.62 var(--serif); }
+a { color: var(--accent); text-underline-offset: 2px; }
+a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.page {
+  display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 56px;
+  max-width: 1180px; margin: 0 auto; padding-inline: 28px; padding-block: 48px 96px;
+}
+nav.toc { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 28px); align-self: start; font: 13px/1.5 var(--sans); }
+nav.toc .toc-title { font-weight: 600; letter-spacing: .08em; text-transform: uppercase; font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+nav.toc ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+nav.toc a { color: var(--muted); text-decoration: none; display: block; }
+nav.toc a:hover { color: var(--accent); }
+nav.toc .step { font-family: var(--mono); font-size: 11.5px; color: var(--accent); margin-right: 6px; }
+
+article { min-width: 0; max-width: 780px; }
+article > * + * { margin-top: 1.05em; }
+p, li { max-width: 68ch; }
+h1, h2, h3 { font-family: var(--sans); text-wrap: balance; line-height: 1.2; }
+h1 { font-size: clamp(30px, 4.4vw, 44px); font-weight: 700; margin: 0; letter-spacing: -0.01em; }
+h2 { font-size: 26px; font-weight: 600; margin-top: 2.6em; padding-top: 1.1em; border-top: 1px solid var(--rule); }
+h3 { font-size: 19px; font-weight: 600; margin-top: 1.8em; }
+.eyebrow { font: 600 12px/1 var(--sans); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+h2 .eyebrow { display: block; margin-bottom: 10px; }
+.lede { font-size: 20px; line-height: 1.55; color: var(--ink); }
+.byline { font: 13px/1.5 var(--sans); color: var(--muted); }
+
+code { font: 0.86em var(--mono); background: var(--code-bg); padding: 0.08em 0.32em; border-radius: 3px; }
+pre { margin: 0; overflow-x: auto; background: var(--code-bg); border: 1px solid var(--rule); padding: 14px 16px; font: 13.2px/1.55 var(--mono); }
+pre code { background: none; padding: 0; font-size: inherit; }
+p code, li code, dd code, .table-note code { white-space: nowrap; }
+pre .c { color: var(--muted); font-style: italic; }
+pre .hl { background: var(--accent-soft); color: var(--ink); }
+pre .old { background: var(--warm-soft); color: var(--ink); }
+.code-label { font: 600 11px/1 var(--sans); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+.code-block { min-width: 0; }
+.pair { display: grid; grid-template-columns: 1fr; gap: 14px; }
+
+.stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; border-top: 1px solid var(--rule-strong); border-bottom: 1px solid var(--rule-strong); }
+.stat { padding: 16px 18px 16px 0; min-width: 0; }
+.stat + .stat { padding-left: 18px; border-left: 1px solid var(--rule); }
+.stat .num { font: 500 28px/1.1 var(--mono); color: var(--accent); font-variant-numeric: tabular-nums; }
+.stat .cap { font: 13px/1.4 var(--sans); color: var(--muted); margin-top: 6px; }
+
+.note { background: var(--tint); padding: 14px 18px; }
+.note .label { font: 600 11px/1 var(--sans); letter-spacing: .1em; text-transform: uppercase; color: var(--accent); margin-bottom: 6px; display: block; }
+.note p { margin: 0; }
+.note p + p { margin-top: 0.6em; }
+.note.cost .label { color: var(--warm); }
+
+.measure { font-family: var(--mono); font-size: 0.86em; font-variant-numeric: tabular-nums; }
+.math { font-family: var(--serif); font-style: italic; white-space: nowrap; }
+ul.math-list { padding-left: 1.2em; }
+ul.math-list li { margin: 0.35em 0; }
+
+figure { margin-inline: 0; }
+figure .svg-wrap { overflow-x: auto; background: var(--paper); border: 1px solid var(--rule); padding: 10px; }
+figure svg { display: block; width: 100%; height: auto; min-width: 560px; color: var(--ink); }
+figcaption { font: 13.5px/1.5 var(--sans); color: var(--muted); margin-top: 8px; max-width: 72ch; }
+
+.table-wrap { overflow-x: auto; border-top: 1px solid var(--rule-strong); border-bottom: 1px solid var(--rule-strong); }
+table.wrap td, table.wrap th { white-space: normal; }
+table.wrap td:first-child { white-space: nowrap; }
+table { border-collapse: collapse; width: 100%; font: 14px/1.4 var(--sans); font-variant-numeric: tabular-nums; }
+th, td { padding: 8px 10px; text-align: right; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+thead th { font-weight: 600; font-size: 12px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+tbody tr:last-child td { border-bottom: none; }
+td.num, th.num { font-family: var(--mono); font-size: 13.5px; }
+tr.total td { font-weight: 600; }
+.up { color: var(--accent); font-weight: 600; }
+.table-note { font: 13px/1.5 var(--sans); color: var(--muted); }
+
+dl.terms { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 18px; margin: 0; font-size: 16px; }
+dl.terms dt { font: 600 14px/1.6 var(--sans); }
+dl.terms dd { margin: 0; max-width: 62ch; }
+ol.checklist { padding-left: 1.3em; }
+ol.checklist li { margin: 0.5em 0; }
+ol.checklist strong { font-family: var(--sans); font-weight: 600; }
+
+/* SVG diagram vocabulary (colors come from the theme tokens) */
+.d-text { fill: var(--ink); font: 12.5px var(--sans); }
+.d-small { fill: var(--muted); font: 11.5px var(--sans); }
+.d-mono { fill: var(--ink); font: 12px var(--mono); }
+.d-on { fill: var(--on-accent); font: 12px var(--mono); }
+.d-head { fill: var(--ink); font: 600 13px var(--sans); }
+.d-line { stroke: var(--ink); stroke-width: 1.3; fill: none; }
+.d-faint { stroke: var(--rule-strong); stroke-width: 1; fill: none; }
+.d-box { stroke: var(--rule-strong); stroke-width: 1; }
+.f-paper { fill: var(--paper); }
+.f-tile { fill: var(--tile); }
+.f-acc { fill: var(--accent); }
+.f-acc2 { fill: var(--accent-soft); }
+.f-warm { fill: var(--warm); }
+.f-warm2 { fill: var(--warm-soft); }
+.f-ink { fill: var(--ink); }
+.s-acc { stroke: var(--accent); stroke-width: 1.4; fill: none; }
+
+@media (max-width: 900px) {
+  .page { grid-template-columns: minmax(0, 1fr); gap: 24px; padding-inline: 18px; padding-block: 28px 64px; }
+  nav.toc { position: static; border-bottom: 1px solid var(--rule); padding-bottom: 16px; }
+  nav.toc ol { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 560px) {
+  body { font-size: 16px; }
+  .lede { font-size: 18px; }
+  .stats { grid-template-columns: minmax(0, 1fr); }
+  .stat + .stat { padding-left: 0; border-left: none; border-top: 1px solid var(--rule); }
+  nav.toc ol { grid-template-columns: minmax(0, 1fr); }
+  dl.terms { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  dl.terms dd { margin-bottom: 10px; }
+}
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+html { scroll-behavior: smooth; }
+</style>
+</head>
+<body>
+<div class="page">
+
+<nav class="toc" aria-label="Contents">
+  <div class="toc-title">Contents</div>
+  <ol>
+    <li><a href="#terms">Words used here</a></li>
+    <li><a href="#perception">What perception computes</a></li>
+    <li><a href="#original">The original grid kernels</a></li>
+    <li><a href="#measure">Measure first</a></li>
+    <li><a href="#lane"><span class="step">1</span>One lane per particle</a></li>
+    <li><a href="#teams"><span class="step">2</span>Warp teams</a></li>
+    <li><a href="#registers"><span class="step">3</span>Registers and spills</a></li>
+    <li><a href="#grid"><span class="step">4</span>Density and grid build</a></li>
+    <li><a href="#host"><span class="step">5</span>Fast kernels, slow host</a></li>
+    <li><a href="#splat"><span class="step">6</span>Hidden syncs in the loss</a></li>
+    <li><a href="#correct">Checking correctness</a></li>
+    <li><a href="#results">Results and costs</a></li>
+    <li><a href="#checklist">Checklist</a></li>
+    <li><a href="#files">Where to find things</a></li>
+  </ol>
+</nav>
+
+<article>
+
+<header>
+  <div class="eyebrow">sphops · CUDA notes</div>
+  <h1>How NPA's SPH perception became fast</h1>
+  <p class="lede">This guide explains the CUDA code that computes perception in Neural Particle Automata (NPA). First it explains the original hash-grid kernels. Then it goes through six changes, starting with fusing the perception operators. Together, they made fused perception 4 to 6 times faster on the GPU than the first fused version, and training about 1.7 times faster.</p>
+  <p class="byline">Setup for all numbers, unless a section says otherwise: RTX 4090, 2D, a batch of 8 × 4,096 particles, 16 state channels, at most 32 particles per grid block. "Before" means the first fused version: earlier fused kernels that this work replaced (see step 1). "Original" means the original unfused code.</p>
+</header>
+
+<div class="stats" role="list">
+  <div class="stat" role="listitem"><div class="num">4.4× / 6.1×</div><div class="cap">faster GPU time for fused perception (forward / backward), average of four kinds of workloads</div></div>
+  <div class="stat" role="listitem"><div class="num">1.68×</div><div class="cap">faster training (300 updates, emoji and texture) than the first fused version</div></div>
+  <div class="stat" role="listitem"><div class="num">2.3–2.4×</div><div class="cap">faster training than the original, unfused SPH operators</div></div>
+</div>
+
+<h2 id="terms"><span class="eyebrow">Before we start</span>Words used here</h2>
+
+<dl class="terms">
+  <dt>Kernel</dt><dd>A function that runs on the GPU. In SPH, "kernel" also means the weight function <span class="math">W</span>. This guide says "SPH kernel" for that.</dd>
+  <dt>Warp, lane</dt><dd>A warp is a group of 32 GPU threads that run the same instruction together. A lane is one thread of a warp.</dd>
+  <dt>Block, SM</dt><dd>A CUDA block is a group of warps that runs on one SM (one of the GPU's processors). The RTX 4090 has 128 SMs.</dd>
+  <dt>Shared memory</dt><dd>Small, fast memory that all threads of one CUDA block can use.</dd>
+  <dt>Register, spill</dt><dd>Registers are the fastest memory. Each thread has its own. If a thread needs too many, extra values go to slow memory. This is called a spill.</dd>
+  <dt>Occupancy</dt><dd>How many warps are active on an SM, compared with the maximum. While one warp waits for memory, the SM runs another one. So more warps can hide waiting time.</dd>
+  <dt>Host, sync</dt><dd>The host is the CPU side (Python and C++). A host sync means the CPU stops and waits until the GPU finishes its work.</dd>
+</dl>
+
+<h2 id="perception"><span class="eyebrow">Background</span>What perception computes</h2>
+
+<p>Each particle <span class="math">i</span> has a position <span class="math">x<sub>i</sub></span>, a mass <span class="math">m<sub>i</sub></span> (fixed during training), and a state <span class="math">s<sub>i</sub></span> with <span class="math">C</span> channels. Perception looks at all neighbors closer than the radius <span class="math">ε</span>. It uses two SPH kernels: the smooth poly6 kernel <span class="math">W</span> and the gradient of the spiky kernel, <span class="math">∇W</span>.</p>
+
+<ul class="math-list">
+  <li>Density: <span class="math">ρ<sub>i</sub> = Σ<sub>j</sub> m<sub>j</sub> W(r<sub>ij</sub>)</span>. Each particle then has a volume <span class="math">V<sub>j</sub> = m<sub>j</sub> / ρ<sub>j</sub></span>.</li>
+  <li>Blur: <span class="math">s̄<sub>i</sub> = Σ<sub>j</sub> V<sub>j</sub> s<sub>j</sub> W(r<sub>ij</sub>)</span>.</li>
+  <li>State gradient: <span class="math">∇s<sub>i</sub> = Σ<sub>j</sub> V<sub>j</sub> (s<sub>j</sub> − s<sub>i</sub>) ∇W(r<sub>ij</sub>)</span>. It is corrected with the inverse of the moment matrix <span class="math">M<sub>i</sub> = Σ<sub>j</sub> V<sub>j</sub> ∇W(r<sub>ij</sub>) ⊗ r<sub>ij</sub></span>. The correction only changes the forward value. The backward pass ignores it (a straight-through estimator).</li>
+  <li>Density gradient: <span class="math">∇ρ<sub>i</sub> = Σ<sub>j</sub> m<sub>j</sub> ∇W(r<sub>ij</sub>)</span>.</li>
+  <li>Scaling: the state gradient is multiplied by <span class="math">ε/ε<sub>0</sub></span>. The density gradient is multiplied by <span class="math">(ε/ε<sub>0</sub>)<sup>D+1</sup></span> and divided by the total mass of the sample, <span class="math">Σ<sub>j</sub> m<sub>j</sub></span>. With unit masses, the total mass is <span class="math">N</span>. This way the density gradient does not depend on the number of particles. Then both gradients get a log normalization: <span class="math">log(1 + |g|) · g / |g|</span>.</li>
+</ul>
+
+<p>The output for each particle is <span class="math">[s, s̄, ∇s, ∇ρ]</span>. It has <span class="math">C(2 + D) + D</span> numbers (66 for C = 16 in 2D), and the NPA's MLP reads it. One training epoch runs 16 to 95 steps, and the backward pass goes through all of them.</p>
+
+<p>All of these are sums over neighbors. So the cost depends on how many neighbors each particle has. The benchmark uses the cases that training really sees:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Case</th><th>Boundary and radius</th><th class="num">Neighbors per particle</th></tr></thead>
+  <tbody>
+    <tr><td>Disk seed for growing (radius 0.2)</td><td>clamped, ε = 0.1</td><td class="num">823</td></tr>
+    <tr><td>Growing disks (radius 0.4 and 0.6)</td><td>clamped, ε = 0.1</td><td class="num">107–227</td></tr>
+    <tr><td>Uniform texture seed</td><td>periodic, ε = 0.2</td><td class="num">131</td></tr>
+    <tr><td>Emoji targets, almost trained (4)</td><td>clamped, ε = 0.1</td><td class="num">57–91</td></tr>
+    <tr><td>Texture targets, almost trained (4)</td><td>periodic, ε = 0.2</td><td class="num">110–170</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The disk seed is the hardest case. In one call there are about 62 million candidate pairs to check, and about 26 million of them are inside the radius.</p>
+
+<h2 id="original"><span class="eyebrow">The starting point</span>The original grid kernels</h2>
+
+<p>The original <code>sph_cuda.cu</code> has two modes. The "particle" mode sorts particles in Morton order. The "grid" mode is used by NPA's 2D configs. This section explains the grid mode. All later versions still use its main ideas. Later, we removed the particle mode, because the fused grid code is faster in 2D and in 3D. The last version with it has the git tag <code>particle-mode-last</code>.</p>
+
+<h3>Sorting particles into cells</h3>
+
+<p>The cell size of the grid is equal to the radius <span class="math">ε</span>. So all neighbors of a particle are in its own cell or in one of the 8 cells around it (26 in 3D). The code reorders the particles, so that particles of the same cell are next to each other in memory. This is a counting sort with three passes:</p>
+
+<figure>
+<div class="svg-wrap">
+<svg viewBox="0 0 760 300" role="img" aria-label="Counting sort in three passes: count the particles in each cell, use a prefix sum to find where each cell starts, then write each particle to the start of its cell plus its rank in the cell.">
+  <defs>
+    <marker id="arrA" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="currentColor"/></marker>
+  </defs>
+  <text class="d-head" x="20" y="40">particles · cell = ⌊x / ε⌋</text>
+  <g>
+    <rect class="d-box f-paper" x="20" y="60" width="60" height="60"/><rect class="d-box f-paper" x="80" y="60" width="60" height="60"/><rect class="d-box f-paper" x="140" y="60" width="60" height="60"/>
+    <rect class="d-box f-paper" x="20" y="120" width="60" height="60"/><rect class="d-box f-paper" x="80" y="120" width="60" height="60"/><rect class="d-box f-paper" x="140" y="120" width="60" height="60"/>
+    <text class="d-small" x="25" y="73">0</text><text class="d-small" x="85" y="73">1</text><text class="d-small" x="145" y="73">2</text>
+    <text class="d-small" x="25" y="133">3</text><text class="d-small" x="85" y="133">4</text><text class="d-small" x="145" y="133">5</text>
+    <circle class="f-acc" cx="44" cy="90" r="5"/><circle class="f-acc" cx="62" cy="106" r="5"/>
+    <circle class="f-warm" cx="158" cy="84" r="5"/><circle class="f-warm" cx="176" cy="100" r="5"/><circle class="f-warm" cx="188" cy="112" r="5"/>
+    <circle class="f-acc" cx="52" cy="156" r="5"/>
+    <circle class="f-warm" cx="100" cy="146" r="5"/><circle class="f-warm" cx="122" cy="168" r="5"/>
+    <circle class="f-acc" cx="168" cy="156" r="5"/>
+  </g>
+  <line class="d-line" x1="206" y1="100" x2="270" y2="80" marker-end="url(#arrA)"/>
+
+  <text class="d-head" x="280" y="40">1 · count per cell (atomicAdd)</text>
+  <g>
+    <rect class="d-box f-acc2" x="280" y="60" width="46" height="30"/><rect class="d-box f-tile" x="326" y="60" width="46" height="30"/><rect class="d-box f-warm2" x="372" y="60" width="46" height="30"/>
+    <rect class="d-box f-acc2" x="418" y="60" width="46" height="30"/><rect class="d-box f-warm2" x="464" y="60" width="46" height="30"/><rect class="d-box f-acc2" x="510" y="60" width="46" height="30"/>
+    <text class="d-mono" x="303" y="80" text-anchor="middle">2</text><text class="d-mono" x="349" y="80" text-anchor="middle">0</text><text class="d-mono" x="395" y="80" text-anchor="middle">3</text>
+    <text class="d-mono" x="441" y="80" text-anchor="middle">1</text><text class="d-mono" x="487" y="80" text-anchor="middle">2</text><text class="d-mono" x="533" y="80" text-anchor="middle">1</text>
+  </g>
+
+  <text class="d-head" x="280" y="124">2 · prefix sum → bin_offsets (where each cell starts)</text>
+  <g>
+    <rect class="d-box f-paper" x="280" y="138" width="46" height="30"/><rect class="d-box f-paper" x="326" y="138" width="46" height="30"/><rect class="d-box f-paper" x="372" y="138" width="46" height="30"/>
+    <rect class="d-box f-paper" x="418" y="138" width="46" height="30"/><rect class="d-box f-paper" x="464" y="138" width="46" height="30"/><rect class="d-box f-paper" x="510" y="138" width="46" height="30"/><rect class="d-box f-paper" x="556" y="138" width="46" height="30"/>
+    <text class="d-mono" x="303" y="158" text-anchor="middle">0</text><text class="d-mono" x="349" y="158" text-anchor="middle">2</text><text class="d-mono" x="395" y="158" text-anchor="middle">2</text>
+    <text class="d-mono" x="441" y="158" text-anchor="middle">5</text><text class="d-mono" x="487" y="158" text-anchor="middle">6</text><text class="d-mono" x="533" y="158" text-anchor="middle">8</text><text class="d-mono" x="579" y="158" text-anchor="middle">9</text>
+  </g>
+
+  <text class="d-head" x="280" y="204">3 · write each particle to bin_offsets[cell] + rank</text>
+  <g>
+    <rect class="d-box f-acc2" x="280" y="216" width="40" height="30"/><rect class="d-box f-acc2" x="320" y="216" width="40" height="30"/>
+    <rect class="d-box f-warm2" x="360" y="216" width="40" height="30"/><rect class="d-box f-warm2" x="400" y="216" width="40" height="30"/><rect class="d-box f-warm2" x="440" y="216" width="40" height="30"/>
+    <rect class="d-box f-acc2" x="480" y="216" width="40" height="30"/>
+    <rect class="d-box f-warm2" x="520" y="216" width="40" height="30"/><rect class="d-box f-warm2" x="560" y="216" width="40" height="30"/>
+    <rect class="d-box f-acc2" x="600" y="216" width="40" height="30"/>
+    <text class="d-small" x="320" y="266" text-anchor="middle">cell 0</text><text class="d-small" x="420" y="266" text-anchor="middle">cell 2</text>
+    <text class="d-small" x="500" y="266" text-anchor="middle">3</text><text class="d-small" x="560" y="266" text-anchor="middle">cell 4</text><text class="d-small" x="620" y="266" text-anchor="middle">5</text>
+  </g>
+</svg>
+</div>
+<figcaption>Counting sort. 1: count the particles in each cell. 2: a prefix sum gives the start of each cell. 3: each particle goes to the start of its cell plus its rank in the cell. The code keeps this permutation, so it can move gradients back to the original order.</figcaption>
+</figure>
+
+<p>The count pass uses one thread per particle. Each thread does an <code>atomicAdd</code> on the counter of its cell. Then the original code ran a second pass with a second <code>atomicAdd</code>, to find the place of each particle inside its cell. Step 4 removes this second atomic.</p>
+
+<div class="code-block">
+<div class="code-label">Original count pass (grid mode)</div>
+<pre><code>uint32_t prev_count = atomicAdd(&amp;cell_counts[cell_idx], 1U);
+if (prev_count % config.MAX_PARTICLES_PER_BLOCK == 0)
+    atomicAdd(&amp;blocks_per_cell[cell_idx], 1U);   <span class="c">// one more grid block for this cell</span></code></pre>
+</div>
+
+<h3>Neighbors are three ranges in memory</h3>
+
+<p>Cells are numbered so that x changes fastest. So the three cells in one row of the 3×3 neighborhood are next to each other in memory. The kernel does not need nine lookups. It reads three ranges of particles, one per row, from <code>bin_offsets[first]</code> to <code>bin_offsets[last + 1]</code>. With periodic boundaries, a row can cross the edge of the domain. Then the code reads a second range for the part that wraps around.</p>
+
+<figure>
+<div class="svg-wrap">
+<svg viewBox="0 0 760 200" role="img" aria-label="The 3 by 3 neighborhood of cell 7 in a grid that is 5 cells wide is three ranges in memory: cells 1 to 3, 6 to 8, and 11 to 13.">
+  <text class="d-head" x="20" y="30">3×3 neighborhood of cell 7</text>
+  <g>
+    <rect class="d-box f-paper" x="20" y="44" width="44" height="44"/><rect class="d-box f-acc2" x="64" y="44" width="44" height="44"/><rect class="d-box f-acc2" x="108" y="44" width="44" height="44"/><rect class="d-box f-acc2" x="152" y="44" width="44" height="44"/><rect class="d-box f-paper" x="196" y="44" width="44" height="44"/>
+    <rect class="d-box f-paper" x="20" y="88" width="44" height="44"/><rect class="d-box f-acc2" x="64" y="88" width="44" height="44"/><rect class="d-box f-acc" x="108" y="88" width="44" height="44"/><rect class="d-box f-acc2" x="152" y="88" width="44" height="44"/><rect class="d-box f-paper" x="196" y="88" width="44" height="44"/>
+    <rect class="d-box f-paper" x="20" y="132" width="44" height="44"/><rect class="d-box f-acc2" x="64" y="132" width="44" height="44"/><rect class="d-box f-acc2" x="108" y="132" width="44" height="44"/><rect class="d-box f-acc2" x="152" y="132" width="44" height="44"/><rect class="d-box f-paper" x="196" y="132" width="44" height="44"/>
+    <text class="d-mono" x="42" y="71" text-anchor="middle">0</text><text class="d-mono" x="86" y="71" text-anchor="middle">1</text><text class="d-mono" x="130" y="71" text-anchor="middle">2</text><text class="d-mono" x="174" y="71" text-anchor="middle">3</text><text class="d-mono" x="218" y="71" text-anchor="middle">4</text>
+    <text class="d-mono" x="42" y="115" text-anchor="middle">5</text><text class="d-mono" x="86" y="115" text-anchor="middle">6</text><text class="d-on" x="130" y="115" text-anchor="middle">7</text><text class="d-mono" x="174" y="115" text-anchor="middle">8</text><text class="d-mono" x="218" y="115" text-anchor="middle">9</text>
+    <text class="d-mono" x="42" y="159" text-anchor="middle">10</text><text class="d-mono" x="86" y="159" text-anchor="middle">11</text><text class="d-mono" x="130" y="159" text-anchor="middle">12</text><text class="d-mono" x="174" y="159" text-anchor="middle">13</text><text class="d-mono" x="218" y="159" text-anchor="middle">14</text>
+  </g>
+  <text class="d-head" x="300" y="66">cells in memory (x changes fastest)</text>
+  <g>
+    <rect class="d-box f-paper" x="300" y="80" width="30" height="34"/>
+    <rect class="d-box f-acc2" x="330" y="80" width="30" height="34"/><rect class="d-box f-acc2" x="360" y="80" width="30" height="34"/><rect class="d-box f-acc2" x="390" y="80" width="30" height="34"/>
+    <rect class="d-box f-paper" x="420" y="80" width="30" height="34"/><rect class="d-box f-paper" x="450" y="80" width="30" height="34"/>
+    <rect class="d-box f-acc2" x="480" y="80" width="30" height="34"/><rect class="d-box f-acc" x="510" y="80" width="30" height="34"/><rect class="d-box f-acc2" x="540" y="80" width="30" height="34"/>
+    <rect class="d-box f-paper" x="570" y="80" width="30" height="34"/><rect class="d-box f-paper" x="600" y="80" width="30" height="34"/>
+    <rect class="d-box f-acc2" x="630" y="80" width="30" height="34"/><rect class="d-box f-acc2" x="660" y="80" width="30" height="34"/><rect class="d-box f-acc2" x="690" y="80" width="30" height="34"/>
+    <rect class="d-box f-paper" x="720" y="80" width="30" height="34"/>
+    <text class="d-mono" x="315" y="102" text-anchor="middle">0</text><text class="d-mono" x="345" y="102" text-anchor="middle">1</text><text class="d-mono" x="375" y="102" text-anchor="middle">2</text><text class="d-mono" x="405" y="102" text-anchor="middle">3</text><text class="d-mono" x="435" y="102" text-anchor="middle">4</text>
+    <text class="d-mono" x="465" y="102" text-anchor="middle">5</text><text class="d-mono" x="495" y="102" text-anchor="middle">6</text><text class="d-on" x="525" y="102" text-anchor="middle">7</text><text class="d-mono" x="555" y="102" text-anchor="middle">8</text><text class="d-mono" x="585" y="102" text-anchor="middle">9</text>
+    <text class="d-mono" x="615" y="102" text-anchor="middle">10</text><text class="d-mono" x="645" y="102" text-anchor="middle">11</text><text class="d-mono" x="675" y="102" text-anchor="middle">12</text><text class="d-mono" x="705" y="102" text-anchor="middle">13</text><text class="d-mono" x="735" y="102" text-anchor="middle">14</text>
+  </g>
+  <path class="d-line" d="M332,124 V132 H418 V124"/><path class="d-line" d="M482,124 V132 H568 V124"/><path class="d-line" d="M632,124 V132 H718 V124"/>
+  <text class="d-small" x="375" y="152" text-anchor="middle">range: row y−1</text><text class="d-small" x="525" y="152" text-anchor="middle">range: row y</text><text class="d-small" x="675" y="152" text-anchor="middle">range: row y+1</text>
+</svg>
+</div>
+<figcaption>Cell 7 and its neighbors. Each row of the 3×3 neighborhood is one range in memory. In 2D a kernel reads three ranges (nine in 3D).</figcaption>
+</figure>
+
+<h3>Grid blocks</h3>
+
+<p>A dense cell can have hundreds of particles. So each cell is split into grid blocks, with at most <code>max_particles_per_block</code> particles each (32 in the training configs). A small <code>BlockInfo</code> record describes each grid block: the cell, the offset inside the cell, the number of particles, and the batch index. One CUDA block processes one grid block.</p>
+
+<p>Only the GPU knows how many grid blocks there are, because it counts the particles. So the code launches enough CUDA blocks for the worst case. Unused blocks have zero particles and stop at once.</p>
+
+<figure>
+<div class="svg-wrap">
+<svg viewBox="0 0 760 104" role="img" aria-label="A cell with 75 particles and a limit of 32 becomes three grid blocks. They start at 0, 32, and 64 and have 32, 32, and 11 particles.">
+  <text class="d-head" x="80" y="24">one cell, 75 binned particles, max_particles_per_block = 32</text>
+  <rect class="d-box f-acc2" x="80" y="36" width="256" height="26"/>
+  <rect class="d-box f-warm2" x="336" y="36" width="256" height="26"/>
+  <rect class="d-box f-acc2" x="592" y="36" width="88" height="26"/>
+  <text class="d-mono" x="208" y="54" text-anchor="middle">block a</text><text class="d-mono" x="464" y="54" text-anchor="middle">block b</text><text class="d-mono" x="636" y="54" text-anchor="middle">block c</text>
+  <text class="d-small" x="208" y="84" text-anchor="middle">offset 0 · 32 particles</text><text class="d-small" x="464" y="84" text-anchor="middle">offset 32 · 32 particles</text><text class="d-small" x="636" y="84" text-anchor="middle">offset 64 · 11</text>
+</svg>
+</div>
+<figcaption>A cell with 75 particles becomes three grid blocks. All particles of a grid block are in the same cell. Step 1 uses this fact.</figcaption>
+</figure>
+
+<h3>One kernel for each operator</h3>
+
+<p>Each SPH operator (count, density, blur, gradient, density gradient, moment matrix) is a version of one template kernel. Each one also has a backward kernel. A CUDA block first copies its own particles into shared memory. Then it goes through the three neighbor ranges in tiles of 128 particles, which it also copies to shared memory. Each thread computes one output value, for one (particle, feature) pair:</p>
+
+<div class="code-block">
+<div class="code-label">Original grid forward, blur part (one thread per particle and feature)</div>
+<pre><code>for (uint32_t i = threadIdx.x; i &lt; local_chunk * feature_dim; i += blockDim.x) {
+    uint32_t particle_idx = i / feature_dim, feature_idx = i % feature_dim;
+    ParticlePosition&lt;DIM&gt; p_i = local_pos[particle_idx];
+    float output = 0.0f;
+    for (uint32_t j = 0; j &lt; remote_chunk; ++j) {
+        ParticlePosition&lt;DIM&gt; p_j = neighbor_pos[j];
+        if (config.l2_distance(p_i, p_j) &lt; eps2) {       <span class="c">// every thread tests the distance</span>
+            float v_j = neighbor_density_rcp[j];
+            float s_j = neighbor_state[j * feature_dim + feature_idx];
+            ParticlePosition&lt;DIM&gt; r_ij = config.displacement(p_i, p_j);
+            float w_ij = smoothing_kernel(r_ij, config.eps);
+            output += s_j * w_ij * v_j;
+        }
+    }
+    local_buffer[i] += output * config.smoothing_coef;
+}</code></pre>
+</div>
+
+<p>In the original code, <code>models/npa.py</code> builds perception from these operators in PyTorch: density, blur, the moment matrix and its inverse, the gradient with the straight-through correction, the density gradient, scaling, log normalization, and concatenation. So the forward pass goes over all neighbors five times, and the backward pass five more times.</p>
+
+<p>The backward kernels also gather: each particle collects its own gradient from its neighbors, because the pair terms are symmetric. Several feature threads add to the gradient of the same particle (for position and density). They use <code>atomicAdd</code> into a shared-memory buffer, and then write the result to global memory once. This design is general. It gives gradients for everything, also for positions and densities.</p>
+
+<h2 id="measure"><span class="eyebrow">Method</span>Measure first</h2>
+
+<p>Every change below started with a measurement and ended with one. These habits made the numbers reliable:</p>
+
+<ul>
+  <li><strong>Test the cases that training sees.</strong> Disk seeds, a uniform texture seed, growing disks, four emoji targets, and four texture targets. We average the targets inside each family, and each family gets the same weight. So the very dense disk does not decide the result alone.</li>
+  <li><strong>Use two timers.</strong> Wrapper latency (CUDA events around the Python call) is what training pays. GPU kernel time (from <code>torch.profiler</code>) counts only the kernels. If the two numbers are very different, the time goes to the host: Python and kernel launches.</li>
+  <li><strong>Compare builds in separate processes.</strong> Each build has its own CMake folder, and <code>NPA_SPH_EXTENSION_PATH</code> selects which one to load. The order of the builds changes every round, so changes in GPU clock and temperature affect all builds the same way.</li>
+  <li><strong>Read the counters that explain the time.</strong> Executed instructions, active threads per warp, occupancy, how busy each unit is, and why warps wait. Instructions divided by candidate pairs is a useful number.</li>
+</ul>
+
+<div class="code-block">
+<div class="code-label">Profiling one kernel (command from BENCHMARKS.md)</div>
+<pre><code>ncu --clock-control none --cache-control none --nvtx --nvtx-include 'npa_profile' \
+  --set basic --export results/sph_profile \
+  python3 -m sphops.testing.benchmark --profile-only --case growing_seed \
+  --block-caps 32 --operations perception --variants fused --profile-pass backward
+<span class="c"># for the "base clock" times in this guide: --clock-control base --set full</span></code></pre>
+</div>
+
+<h2 id="lane"><span class="eyebrow">Step 1</span>One lane per particle</h2>
+
+<p>First, we fuse the operators. With the original operators, perception goes over all neighbors five times in the forward pass and five more times in the backward pass. NPA trains with fixed masses, positions without gradients, and gradients only for the states. For this setting, four kernels are enough. <code>density_forward</code> computes the density, the density gradient and the volumes. <code>forward</code> computes the blur, the gradient, the moments, the correction and the normalization, and writes the output. <code>backward_prepare</code> undoes the normalization. <code>backward</code> gets the blur and gradient parts of the state gradient in one pass. Other channel counts are padded to 4, 8, 16 or 32. A first fused version of these kernels existed before this work: it is the "before" in this guide. This step keeps the fusion and changes how threads are mapped to the work in <code>forward</code> and <code>backward</code>. Step 4 does the same for <code>density_forward</code>.</p>
+
+<p>The idea comes from the original design. All particles in a grid block are in the same cell. So they all have the same list of candidate neighbors, in the same order. The original kernels already use this: at loop step <span class="math">j</span>, all threads of a warp read neighbor <span class="math">j</span> from shared memory. When all lanes read the same address, shared memory gives the value to all of them in one transaction. This is called a broadcast.</p>
+
+<p>But the original kernels use one thread for each (particle, channel) pair. So for every candidate pair, the 16 channel threads of a particle test the same distance and compute the same weights. The pair work is done 16 times. In the 2D lizard profile, the original blur and gradient kernels execute 71 and 89 million warp instructions. The original density kernel has one thread per particle, and for the same pairs it executes only 8 million.</p>
+
+<p>Step 1 changes the mapping. Lane <span class="math">k</span> handles particle <span class="math">k</span>, with all of its channels. For each pair, the lane computes the distance and the weights once, and then updates all 16 channels. The price is registers: each lane keeps its particle's 16 state values and all of its partial sums (16 for the blur, 32 for the gradient, and the moment terms, in 2D). Step 3 deals with this.</p>
+
+<figure>
+<div class="svg-wrap">
+<svg viewBox="0 0 760 250" role="img" aria-label="Left, original kernels: 16 threads per particle, one per channel. Every thread computes the distance and the weights for the same pair, so this work is repeated 16 times. Right, new version: one lane per particle. All 32 lanes read the same neighbor from shared memory in one broadcast, and each lane computes the weights once and updates all 16 channels.">
+  <defs>
+    <marker id="arrD" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="currentColor"/></marker>
+  </defs>
+  <text class="d-head" x="10" y="24">Original: one thread per (particle, channel)</text>
+  <text class="d-small" x="10" y="44">neighbor j: also one broadcast read</text>
+  <text class="d-small" x="97" y="78" text-anchor="middle">particle A</text><text class="d-small" x="273" y="78" text-anchor="middle">particle B</text>
+  <path class="d-faint" d="M12,84 V88 H183 V84"/><path class="d-faint" d="M188,84 V88 H359 V84"/>
+  <g>
+    <rect class="f-warm" x="10" y="96" width="10" height="22"/><rect class="f-warm" x="21" y="96" width="10" height="22"/><rect class="f-warm" x="32" y="96" width="10" height="22"/><rect class="f-warm" x="43" y="96" width="10" height="22"/><rect class="f-warm" x="54" y="96" width="10" height="22"/><rect class="f-warm" x="65" y="96" width="10" height="22"/><rect class="f-warm" x="76" y="96" width="10" height="22"/><rect class="f-warm" x="87" y="96" width="10" height="22"/><rect class="f-warm" x="98" y="96" width="10" height="22"/><rect class="f-warm" x="109" y="96" width="10" height="22"/><rect class="f-warm" x="120" y="96" width="10" height="22"/><rect class="f-warm" x="131" y="96" width="10" height="22"/><rect class="f-warm" x="142" y="96" width="10" height="22"/><rect class="f-warm" x="153" y="96" width="10" height="22"/><rect class="f-warm" x="164" y="96" width="10" height="22"/><rect class="f-warm" x="175" y="96" width="10" height="22"/>
+    <rect class="f-warm" x="186" y="96" width="10" height="22"/><rect class="f-warm" x="197" y="96" width="10" height="22"/><rect class="f-warm" x="208" y="96" width="10" height="22"/><rect class="f-warm" x="219" y="96" width="10" height="22"/><rect class="f-warm" x="230" y="96" width="10" height="22"/><rect class="f-warm" x="241" y="96" width="10" height="22"/><rect class="f-warm" x="252" y="96" width="10" height="22"/><rect class="f-warm" x="263" y="96" width="10" height="22"/><rect class="f-warm" x="274" y="96" width="10" height="22"/><rect class="f-warm" x="285" y="96" width="10" height="22"/><rect class="f-warm" x="296" y="96" width="10" height="22"/><rect class="f-warm" x="307" y="96" width="10" height="22"/><rect class="f-warm" x="318" y="96" width="10" height="22"/><rect class="f-warm" x="329" y="96" width="10" height="22"/><rect class="f-warm" x="340" y="96" width="10" height="22"/><rect class="f-warm" x="351" y="96" width="10" height="22"/>
+  </g>
+  <text class="d-mono" x="97" y="136" text-anchor="middle">c0 … c15</text><text class="d-mono" x="273" y="136" text-anchor="middle">c0 … c15</text>
+  <text class="d-small" x="10" y="166">every thread: distance, W, ∇W, then one channel</text>
+  <rect class="f-warm" x="10" y="181" width="10" height="10"/><text class="d-small" x="26" y="190">the same pair work, done 16 times</text>
+
+  <line class="d-faint" x1="380" y1="10" x2="380" y2="240"/>
+
+  <text class="d-head" x="400" y="24">Now: one lane per particle</text>
+  <text class="d-small" x="400" y="44">neighbor tile in shared memory</text>
+  <g>
+    <rect class="d-box f-paper" x="400" y="52" width="40" height="24"/><rect class="d-box f-acc" x="440" y="52" width="40" height="24"/><rect class="d-box f-paper" x="480" y="52" width="40" height="24"/><rect class="d-box f-paper" x="520" y="52" width="40" height="24"/><rect class="d-box f-paper" x="560" y="52" width="40" height="24"/><rect class="d-box f-paper" x="600" y="52" width="40" height="24"/>
+    <text class="d-mono" x="420" y="69" text-anchor="middle">j−1</text><text class="d-on" x="460" y="69" text-anchor="middle">j</text><text class="d-mono" x="500" y="69" text-anchor="middle">j+1</text><text class="d-mono" x="540" y="69" text-anchor="middle">…</text>
+  </g>
+  <line class="d-line" x1="460" y1="78" x2="405" y2="140" marker-end="url(#arrD)"/>
+  <line class="d-line" x1="460" y1="78" x2="493" y2="140" marker-end="url(#arrD)"/>
+  <line class="d-line" x1="460" y1="78" x2="581" y2="140" marker-end="url(#arrD)"/>
+  <line class="d-line" x1="460" y1="78" x2="669" y2="140" marker-end="url(#arrD)"/>
+  <line class="d-line" x1="460" y1="78" x2="746" y2="140" marker-end="url(#arrD)"/>
+  <text class="d-small" x="652" y="62">same address:</text>
+  <text class="d-small" x="652" y="76">one broadcast</text>
+  <g>
+    <rect class="f-acc" x="400" y="146" width="10" height="22"/><rect class="f-acc" x="411" y="146" width="10" height="22"/><rect class="f-acc" x="422" y="146" width="10" height="22"/><rect class="f-acc" x="433" y="146" width="10" height="22"/><rect class="f-acc" x="444" y="146" width="10" height="22"/><rect class="f-acc" x="455" y="146" width="10" height="22"/><rect class="f-acc" x="466" y="146" width="10" height="22"/><rect class="f-acc" x="477" y="146" width="10" height="22"/>
+    <rect class="f-acc" x="488" y="146" width="10" height="22"/><rect class="f-acc" x="499" y="146" width="10" height="22"/><rect class="f-acc" x="510" y="146" width="10" height="22"/><rect class="f-acc" x="521" y="146" width="10" height="22"/><rect class="f-acc" x="532" y="146" width="10" height="22"/><rect class="f-acc" x="543" y="146" width="10" height="22"/><rect class="f-acc" x="554" y="146" width="10" height="22"/><rect class="f-acc" x="565" y="146" width="10" height="22"/>
+    <rect class="f-acc" x="576" y="146" width="10" height="22"/><rect class="f-acc" x="587" y="146" width="10" height="22"/><rect class="f-acc" x="598" y="146" width="10" height="22"/><rect class="f-acc" x="609" y="146" width="10" height="22"/><rect class="f-acc" x="620" y="146" width="10" height="22"/><rect class="f-acc" x="631" y="146" width="10" height="22"/><rect class="f-acc" x="642" y="146" width="10" height="22"/><rect class="f-acc" x="653" y="146" width="10" height="22"/>
+    <rect class="f-acc" x="664" y="146" width="10" height="22"/><rect class="f-acc" x="675" y="146" width="10" height="22"/><rect class="f-acc" x="686" y="146" width="10" height="22"/><rect class="f-acc" x="697" y="146" width="10" height="22"/><rect class="f-acc" x="708" y="146" width="10" height="22"/><rect class="f-acc" x="719" y="146" width="10" height="22"/><rect class="f-acc" x="730" y="146" width="10" height="22"/><rect class="f-acc" x="741" y="146" width="10" height="22"/>
+  </g>
+  <text class="d-small" x="400" y="190">lane k = particle k (32 particles of one cell)</text>
+  <text class="d-small" x="400" y="209">each lane: distance, W, ∇W, then all 16 channels</text>
+</svg>
+</div>
+<figcaption>The same work, mapped in two ways. Left (original): 16 threads per particle, one per channel. Every thread computes the distance and the weights for the same pair, so this work is done 16 times. Right (now): one lane per particle. Every lane reads the same neighbor in one broadcast, computes the weights once, and updates all 16 channels, which it keeps in registers.</figcaption>
+</figure>
+
+<p>Compared with the original kernels, this removes the 15 extra copies of the pair work. If a pair is outside the radius, the lane skips it with <code>continue</code>, once for all channels. The neighbor's position and its 16 state channels still come from shared memory as broadcasts. The channels are read as four <code>float4</code> values (16 bytes each).</p>
+
+<div class="code-block">
+<div class="code-label">New forward, inner loop (one lane per particle)</div>
+<pre><code>for (unsigned int j = 0; j &lt; count; ++j) {
+    ParticlePosition&lt;DIM&gt; r = config.displacement(position, tile_pos[j]);   <span class="c">// broadcast read</span>
+    float d2 = dot(r, r);
+<span class="hl">    if (d2 &gt;= h2)</span>
+<span class="hl">        continue;                                   // outside the radius: skip</span>
+    float weight, grad_weight[DIM];
+    support_weights(config, r, d2, h2, weight, grad_weight);
+    float v = tile_volume[j];
+    ...                                             <span class="c">// moments, once per pair</span>
+<span class="hl">    const float4 *remote_state = reinterpret_cast&lt;const float4 *&gt;(&amp;tile_state[j * CHANNELS]);</span>
+    #pragma unroll
+    for (int q = 0; q &lt; CHANNELS / 4; ++q) {
+        float4 packed = remote_state[q];
+        float values[4] = {packed.x, packed.y, packed.z, packed.w};
+        #pragma unroll
+        for (int k = 0; k &lt; 4; ++k) {
+            int c = 4 * q + k;
+            partial[BLUR + c] += values[k] * (weight * v);
+            float difference = (values[k] - local_state[c]) * v;
+            #pragma unroll
+            for (int d = 0; d &lt; DIM; ++d)
+                partial[GRADIENT + c * DIM + d] += difference * grad_weight[d];
+        }
+    }
+}</code></pre>
+</div>
+
+<p>On the dense disk seed, the original blur, gradient and moment-matrix kernels execute 1.25 billion warp instructions. The fused forward kernel does the same work with 240 million, 5.2 times fewer. Both changes help: one pass over the neighbors instead of three, and the pair work done once. At first, this kernel used one warp per grid block (step 2 changes this). For 32 channels, two warps share the work (16 channels each), so that each thread does not need too many registers.</p>
+
+<div class="note">
+  <span class="label">Trick</span>
+  <p>Look for data that many threads need at the same time. Here the grid design already had it: one grid block, one cell, one list of candidates. If all threads read the same address, shared memory gives the value to all of them for the price of one read.</p>
+  <p>Then look for work that many threads repeat. Here the pair weights were the same for all channels of a particle. Give that work to one thread, and let it reuse the result for every channel. Registers pay for this.</p>
+</div>
+
+<h2 id="teams"><span class="eyebrow">Step 2</span>Not enough warps: warp teams</h2>
+
+<p>The new forward took 0.80 ms (at base clocks) instead of 2.58 ms. So it was 3.2 times faster. That is good, but the number of instructions went down 8.7 times, so we expected more. Nsight Compute showed only 14% occupancy and 1.23 instructions per cycle.</p>
+
+<p>The reason: there were too few warps. With one lane per particle, 32,768 particles give only about 1,024 warps. That is about 8 warps per SM. Each warp goes through about 1,900 candidates alone. When a warp waits for memory, the SM has almost no other warp to run.</p>
+
+<p>The fix is to split the loop over neighbors, not the outputs. Each grid block now has four warps, called teams, and all four work on the same 32 particles. The neighbor tiles are dealt like cards: team <span class="math">t</span> takes tiles <span class="math">t, t+4, t+8</span>, and so on. Each team loads its tiles into its own part of shared memory. So the loop only needs <code>__syncwarp</code> (a sync of one warp), not a sync of the whole block. At the end, teams 1–3 add their partial sums into team 0 through shared memory, always in the same order.</p>
+
+<figure>
+<div class="svg-wrap">
+<svg viewBox="0 0 760 276" role="img" aria-label="Twelve neighbor tiles of one grid block are dealt to four warps like cards. Each warp sums its tiles for the same 32 particles. Then warps 1 to 3 add their sums into warp 0 in a fixed order.">
+  <defs>
+    <marker id="arrE" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="currentColor"/></marker>
+  </defs>
+  <text class="d-head" x="100" y="22">neighbor tiles of one grid block (32 candidates each)</text>
+  <g>
+    <rect class="d-box f-acc" x="100" y="34" width="46" height="26"/><rect class="d-box f-acc2" x="152" y="34" width="46" height="26"/><rect class="d-box f-warm" x="204" y="34" width="46" height="26"/><rect class="d-box f-warm2" x="256" y="34" width="46" height="26"/>
+    <rect class="d-box f-acc" x="308" y="34" width="46" height="26"/><rect class="d-box f-acc2" x="360" y="34" width="46" height="26"/><rect class="d-box f-warm" x="412" y="34" width="46" height="26"/><rect class="d-box f-warm2" x="464" y="34" width="46" height="26"/>
+    <rect class="d-box f-acc" x="516" y="34" width="46" height="26"/><rect class="d-box f-acc2" x="568" y="34" width="46" height="26"/><rect class="d-box f-warm" x="620" y="34" width="46" height="26"/><rect class="d-box f-warm2" x="672" y="34" width="46" height="26"/>
+    <text class="d-on" x="123" y="52" text-anchor="middle">t0</text><text class="d-mono" x="175" y="52" text-anchor="middle">t1</text><text class="d-on" x="227" y="52" text-anchor="middle">t2</text><text class="d-mono" x="279" y="52" text-anchor="middle">t3</text>
+    <text class="d-on" x="331" y="52" text-anchor="middle">t4</text><text class="d-mono" x="383" y="52" text-anchor="middle">t5</text><text class="d-on" x="435" y="52" text-anchor="middle">t6</text><text class="d-mono" x="487" y="52" text-anchor="middle">t7</text>
+    <text class="d-on" x="539" y="52" text-anchor="middle">t8</text><text class="d-mono" x="591" y="52" text-anchor="middle">t9</text><text class="d-on" x="643" y="52" text-anchor="middle">t10</text><text class="d-mono" x="695" y="52" text-anchor="middle">t11</text>
+  </g>
+  <text class="d-text" x="20" y="108">warp 0</text><text class="d-text" x="20" y="148">warp 1</text><text class="d-text" x="20" y="188">warp 2</text><text class="d-text" x="20" y="228">warp 3</text>
+  <line class="d-faint" x1="100" y1="103" x2="718" y2="103"/><line class="d-faint" x1="100" y1="143" x2="718" y2="143"/><line class="d-faint" x1="100" y1="183" x2="718" y2="183"/><line class="d-faint" x1="100" y1="223" x2="718" y2="223"/>
+  <g>
+    <rect class="d-box f-acc" x="100" y="92" width="46" height="22"/><rect class="d-box f-acc" x="308" y="92" width="46" height="22"/><rect class="d-box f-acc" x="516" y="92" width="46" height="22"/>
+    <rect class="d-box f-acc2" x="152" y="132" width="46" height="22"/><rect class="d-box f-acc2" x="360" y="132" width="46" height="22"/><rect class="d-box f-acc2" x="568" y="132" width="46" height="22"/>
+    <rect class="d-box f-warm" x="204" y="172" width="46" height="22"/><rect class="d-box f-warm" x="412" y="172" width="46" height="22"/><rect class="d-box f-warm" x="620" y="172" width="46" height="22"/>
+    <rect class="d-box f-warm2" x="256" y="212" width="46" height="22"/><rect class="d-box f-warm2" x="464" y="212" width="46" height="22"/><rect class="d-box f-warm2" x="672" y="212" width="46" height="22"/>
+  </g>
+  <path class="d-line" d="M724,223 H742 V110" marker-end="url(#arrE)"/>
+  <line class="d-line" x1="724" y1="183" x2="742" y2="183"/><line class="d-line" x1="724" y1="143" x2="742" y2="143"/>
+  <text class="d-small" x="100" y="262">then warps 1–3 add their sums into warp 0, always in the same order</text>
+</svg>
+</div>
+<figcaption>The neighbor tiles of one grid block are dealt to four warps, so there are four times more warps and no pair is computed twice. Then warps 1–3 add their sums into warp 0, always in the same order. The fixed order gives the same result in every run. Warp 0 then finishes the math and writes the outputs.</figcaption>
+</figure>
+
+<div class="pair">
+<div class="code-block">
+<div class="code-label">Choosing tiles (main loop of each warp)</div>
+<pre><code>for (unsigned int remote = first; remote &lt; end; remote += TILE) {
+<span class="hl">    if (tile_index++ % NEIGHBOR_WARPS != team)</span>
+<span class="hl">        continue;                         // another team takes this tile</span>
+    unsigned int count = min(unsigned(TILE), end - remote);
+    __syncwarp();                         <span class="c">// finish reading the previous tile</span>
+    if (lane &lt; count) {
+        tile_pos[lane] = positions[remote + lane];
+        tile_volume[lane] = volume[remote + lane];
+    }
+    #pragma unroll 4
+    for (unsigned int k = lane; k &lt; count * CHANNELS; k += 32)
+        tile_state[k] = state[(remote + k / CHANNELS) * FEATURES + first_channel + k % CHANNELS];
+    __syncwarp();                         <span class="c">// now the whole warp can read the tile</span>
+    if (!valid)
+        continue;                         <span class="c">// lanes without a particle only help load</span>
+    ...                                   <span class="c">// the pair loop from step 1</span>
+}</code></pre>
+</div>
+<div class="code-block">
+<div class="code-label">Adding team sums in a fixed order (simplified <code>reduce_teams</code>)</div>
+<pre><code>__syncthreads();                          <span class="c">// this buffer reuses the tile memory</span>
+for (int base = 0; base &lt; PARTIALS; base += CHUNK) {
+    if (team &gt; 0)                         <span class="c">// teams 1..3 write part of their sums</span>
+        for (int e = 0; e &lt; CHUNK; ++e)
+            slot[e * 32] = partial[base + e];
+    __syncthreads();
+    if (team == 0)                        <span class="c">// team 0 adds them: team 1, 2, then 3</span>
+        for (int source = 1; source &lt; NEIGHBOR_WARPS; ++source)
+            for (int e = 0; e &lt; CHUNK; ++e)
+                partial[base + e] += slot_of(source)[e * 32];
+    __syncthreads();
+}</code></pre>
+</div>
+</div>
+
+<p>Speedup for different numbers of teams (C = 16, wrapper latency, average over the four families, compared with the first fused version):</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Teams per grid block</th><th class="num">Forward</th><th class="num">Backward</th></tr></thead>
+  <tbody>
+    <tr><td>1 (same order of additions as before)</td><td class="num">2.96×</td><td class="num">3.69×</td></tr>
+    <tr><td>2</td><td class="num">3.65×</td><td class="num">4.63×</td></tr>
+    <tr><td>3</td><td class="num">3.85×</td><td class="num">4.98×</td></tr>
+    <tr><td>4</td><td class="num">4.05×</td><td class="num">4.92×</td></tr>
+    <tr><td>4, with the register limit from step 3</td><td class="num up">4.21×</td><td class="num up">5.20×</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>With more than one team, the float additions happen in a different order. So the results change a little, at roundoff level. Over all test cases, the relative L2 difference was at most 9.1 × 10<sup>−7</sup> for outputs and 1.5 × 10<sup>−6</sup> for gradients. With <code>NEIGHBOR_WARPS = 1</code>, the code uses the old order again. We used this setting to check the new code bit by bit.</p>
+
+<div class="note">
+  <span class="label">Trick</span>
+  <p>After you remove work, check that there are still enough warps to hide waiting time. If you already have one lane per output, split the sum (here, the loop over neighbors) across warps. Then add the partial sums at the end in a fixed order.</p>
+</div>
+
+<h2 id="registers"><span class="eyebrow">Step 3</span>Registers, spills, and one build flag</h2>
+
+<p><code>__launch_bounds__(128)</code> tells the compiler that a block has at most 128 threads. With only this, the compiler used 223–250 registers per thread in the forward kernel. Then only 2 blocks fit on one SM, and the gain from step 2 would be lost. The second argument of <code>__launch_bounds__</code> is the minimum number of blocks that must fit on one SM. This sets a limit on registers:</p>
+
+<div class="code-block">
+<div class="code-label">fused_perception.cuh</div>
+<pre><code><span class="c">// At least 16 resident warps per SM → at most 65,536 / (16 × 32) = 128 registers</span>
+constexpr int FORWARD_RESIDENT_WARPS = 16;
+template &lt;int DIM, int FEATURES, BoundaryCondition BC&gt;
+__global__ void __launch_bounds__(ForwardLayout&lt;DIM, FEATURES&gt;::THREADS,
+                                  ForwardLayout&lt;DIM, FEATURES&gt;::MIN_BLOCKS) forward(...)</code></pre>
+</div>
+
+<p>With this limit, the kernels spilled registers to slow memory. To study this, we compiled only the perception kernels in a small test file with <code>-Xptxas -v</code>. This takes a few seconds instead of the 80 seconds of the full build, and it prints the spills of each kernel. The result was strange: the small test file almost did not spill, but the real build spilled a lot. The difference was one CMake setting:</p>
+
+<div class="pair">
+<div class="code-block">
+<div class="code-label">ptxas -v output: forward kernel, C = 16, 96 registers</div>
+<pre><code><span class="c"># standalone translation unit</span>
+8 bytes stack frame, 4 bytes spill stores, 8 bytes spill loads
+<span class="c"># same kernel with -rdc=true (relocatable device code)</span>
+152 bytes stack frame, 468 bytes spill stores, 720 bytes spill loads</code></pre>
+</div>
+<div class="code-block">
+<div class="code-label">CMakeLists.txt</div>
+<pre><code><span class="c"># One translation unit without device-side launches: whole-program device</span>
+<span class="c"># compilation lets ptxas allocate registers without relocatable-code limits</span>
+<span class="c"># (relocatable builds spill in the fused perception kernels).</span>
+set_property(TARGET sph_cuda PROPERTY CUDA_SEPARABLE_COMPILATION <span class="hl">OFF</span>)</code></pre>
+</div>
+</div>
+
+<p>Separable compilation (<code>-rdc</code>) is only needed when GPU code calls functions in another <code>.cu</code> file. This extension has only one <code>.cu</code> file. Turning it off removed the spills.</p>
+
+<p>Then we raised the forward kernel's limit to 128 registers (at least 16 warps per SM instead of 32). This removed the last small spill. At this point the forward kernel used 123–126 registers and no stack. This is the last row of the table in step 2.</p>
+
+<p>Two smaller changes also helped. The loop that adds the team sums stays rolled (<code>#pragma unroll 1</code>), so the compiler does not load the values of all teams at once. And the loop that loads tiles is unrolled only 4 times.</p>
+
+<div class="note">
+  <span class="label">Trick</span>
+  <p><code>cuobjdump --dump-resource-usage</code> shows registers, stack, and shared memory for every kernel in a built library. <code>-Xptxas -v</code> on a small test file gives fast answers. But always use the same build flags as the real build.</p>
+</div>
+
+<h2 id="grid"><span class="eyebrow">Step 4</span>The density kernel and the grid build</h2>
+
+<p>After the feature kernels became fast, the density pass was 23% of the forward kernel time. It still used one warp per particle, with a shuffle sum for each particle. We rewrote it in the same style: one lane per particle, and neighbor positions and masses in team tiles. On the disk seed, it went from 134 to 99 µs. The average forward speedup went from 4.17× to 4.48×.</p>
+
+<p>The grid build had an easier win. In the count pass, <code>atomicAdd</code> returns the old count of the cell. This old count is the rank of the particle inside its cell. If we save it, the scatter pass does not need its own <code>atomicAdd</code>, and it does not need the extra array for it.</p>
+
+<div class="pair">
+<div class="code-block">
+<div class="code-label">Count pass: save the rank</div>
+<pre><code>uint32_t prev_count = atomicAdd(&amp;cell_counts[cell_idx], 1U);
+<span class="hl">rank_in_cell[idx] = prev_count;           // stored in the permutation buffer</span></code></pre>
+</div>
+<div class="code-block">
+<div class="code-label">Scatter pass: no second atomic</div>
+<pre><code><span class="old">// before: write_idx = atomicAdd(&amp;bin_write_indices[cell], 1U);</span>
+<span class="hl">permutation[idx] += bin_offsets[batch_idx * config.cell_count + hash]</span>
+<span class="hl">                    - batch_idx * config.particle_count;</span></code></pre>
+</div>
+</div>
+
+<p>We also removed memsets for buffers that are always fully overwritten (permutation, bin offsets, block offsets). The two counter arrays now share one allocation, so one memset clears both. A grid build now uses 9 launches instead of 14. All of them run on the caller's CUDA stream.</p>
+
+<h2 id="host"><span class="eyebrow">Step 5</span>Fast kernels, slow host</h2>
+
+<p>After steps 1–4, the GPU was busy for only about 54 ms of a 135 ms emoji training epoch (measured in the profiler). Each rollout step launched about 89 small kernels, and Python could not launch them fast enough.</p>
+
+<p>To measure only the host cost, we ran the step on a very small problem, where GPU time is almost zero:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Host time per call (tiny problem)</th><th class="num">Before</th><th class="num">After</th></tr></thead>
+  <tbody>
+    <tr><td>Grid build + binning + perception, forward</td><td class="num">216 µs</td><td class="num">119 µs</td></tr>
+    <tr><td>NPA training step, forward</td><td class="num">572 µs</td><td class="num up">447 µs</td></tr>
+    <tr><td>NPA training step, forward + backward</td><td class="num">1,190 µs</td><td class="num up">990 µs</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="table-note">Before: <code>grid.instantiate</code> (47 µs), <code>bin_particles</code> (59 µs), and <code>perception</code> (110 µs) were separate calls. After: one call of 119 µs. Of this, 45 µs is the C++ call, 8 µs is memory allocation, and the rest is autograd and Python. Each tensor passed through nanobind costs about 2 µs, and each kernel launch costs 2–3.5 µs.</p>
+
+<p>The fix is one autograd function, with one C++ call for the forward and one for the backward:</p>
+
+<ul>
+  <li>The forward call builds the grid, sorts positions and states into cells, and runs the density and feature kernels.</li>
+  <li>The backward call computes the perception gradient, adds the gradient that reaches <code>s_bin</code> from the rest of the model, and moves the result back to the original order.</li>
+  <li>The grid data lives in one int32 buffer, and the saved values live in one float buffer. So 28 tensor conversions became 9.</li>
+  <li>When there are no masses, the code reads a buffer of ones that it keeps between steps. Before, it made and sorted a new one in every step.</li>
+</ul>
+
+<div class="code-block">
+<div class="code-label">sph.py (simplified)</div>
+<pre><code>class FusedPerception(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, s, mass, grid, eps0, density_grad, log_norm_grad,
+                log_norm_density_grad, save_backward):
+        snapshot = x.new_empty(hashgrid.fused_snapshot_words, dtype=torch.int32)
+        x_bin, s_bin = torch.empty_like(x), torch.empty_like(s)
+        output = s.new_empty(B, N, C * (2 + dim) + (dim if density_grad else 0))
+        workspace = s.new_empty(hashgrid.fused_workspace_size(...))
+<span class="hl">        hashgrid.fused_perception_forward(x, s, mass, eps0, snapshot, x_bin, s_bin,</span>
+<span class="hl">                                          output, workspace, ..., stream)   # one call</span>
+        ctx.save_for_backward(x_bin, workspace, eps0, snapshot)
+        return output, x_bin, s_bin, snapshot
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_x_bin, grad_s_bin, _):
+        <span class="c"># perception gradient + grad_s_bin, then unbin: also one C++ call</span></code></pre>
+</div>
+
+<div class="note">
+  <span class="label">Trick</span>
+  <p>Autograd would add the two gradients of <code>s_bin</code> (one from perception, one from the Euler update) with one <code>a + b</code>. The unbinning kernel does the same single addition. <code>a + b</code> and <code>b + a</code> give the same float, so the result is bit-for-bit the same.</p>
+</div>
+
+<p>The emoji epoch went from 87 to 77 ms. Most of the remaining host time is in the MLP and the Euler update, which are plain PyTorch. The optional <code>NPA(compile_step=True)</code> compiles them and saves another 7–11%.</p>
+
+<h2 id="splat"><span class="eyebrow">Step 6</span>Hidden syncs in the loss</h2>
+
+<p>The loss draws the particles into images. This is called splatting. The old code used a Python loop over the batch. For each sample, it kept only the kernel taps inside the image, with a boolean mask.</p>
+
+<p>To index with a boolean mask, PyTorch must know how many values are true. So the CPU must wait for the GPU: a host sync. This happened 8 times per forward pass, and more times in the backward. At each sync, the GPU runs out of work and waits until Python catches up.</p>
+
+<div class="code-block">
+<div class="code-label">utils/splatting.py: one pass for the whole batch</div>
+<pre><code><span class="old"># before, per sample: flat_idx = (y_idx * img_size + x_idx)[mask]   ← host sync</span>
+flat_idx = (y_idx.clamp(0, img_size - 1)[..., :, None] * img_size
+            + x_idx.clamp(0, img_size - 1)[..., None, :]
+            + (torch.arange(B, device=device) * img_size * img_size)[:, None, None, None])
+<span class="hl">w = torch.where(mask, g, 0.0)        # taps outside the image add exactly 0</span>
+c = torch.where(mask[..., None], colors[:, :, None, :] * w[..., None], 0.0)
+density.scatter_add_(0, flat_idx.reshape(-1, 1), w.reshape(-1, 1))
+rgb.scatter_add_(0, flat_idx.reshape(-1, 1).expand(-1, 3), c.reshape(-1, 3))</code></pre>
+</div>
+
+<p>The new code does not remove the taps outside the image. It clamps their index to a valid pixel and adds exactly zero there. So all tensors have a fixed shape, and nothing needs to count the taps. The second <code>where</code> makes sure that a NaN or Inf color of a particle outside the image does not reach the image or the gradients. On CPU, the new images are bitwise equal to the old ones.</p>
+
+<p>This small change had a big effect. With the fast kernels and the old splatting, the emoji backward still took 72 ms per epoch. With the new splatting, it took 40 ms, because the GPU no longer stops between samples.</p>
+
+<h2 id="correct"><span class="eyebrow">Method</span>Checking that results stay correct</h2>
+
+<p>A faster version is only useful if the results stay the same. We checked in layers, from the strictest test to the loosest:</p>
+
+<ol class="checklist">
+  <li><strong>Bitwise A/B on the same input.</strong> Binning uses atomics, so the order of particles inside a cell changes from run to run. Then every sum changes a little. So the A/B script saves one grid snapshot (sorted positions, offsets, block info) and gives the same snapshot to both builds. With this, the old fused kernels give the same bits every time. The new kernels with <code>NEIGHBOR_WARPS = 1</code> gave the same bits as the old ones in 2D.</li>
+  <li><strong>Tolerance tests against other code.</strong> A simple dense PyTorch version (<code>sphops/testing/torch_sph.py</code>) and the original SPH operators. The tests cover 2D and 3D, both boundaries, normal and padded channel counts up to 32, block sizes 16/32/64, different masses, singular moment matrices, and the periodic seam.</li>
+  <li><strong>Gradient checks at the saved point.</strong> <code>log(1 + |g|)</code> first rounds <code>1 + |g|</code>. For a tiny <span class="math">g</span>, a change in the last bits can change the derivative. So the test computes the reference gradient at the values that the fused kernel saved. Then both sides use exactly the same point.</li>
+  <li><strong>Compute Sanitizer.</strong> memcheck, synccheck, initcheck (it finds a removed memset that was still needed), and racecheck (for the per-warp tiles and the reused shared buffers).</li>
+  <li><strong>Matched training runs.</strong> Same weights, same pool, same sampling, and the same number of steps. Repeated timings were within 0.3%. We compared loss differences with the normal run-to-run noise of the old code.</li>
+</ol>
+
+<div class="note cost">
+  <span class="label">Problems we hit</span>
+  <p>A ReLU input very close to zero (below 10<sup>−5</sup>) can have a different sign in two correct versions. Then the gradient of a whole neuron changes. So the parameter-gradient test needs a special case for this.</p>
+  <p>With kernel filters, initcheck reports false errors: memory written by kernels outside the filter looks uninitialized. Racecheck on all kernels needed more than 11 GB of CPU memory. Limiting it to the changed kernels needed only a few GB.</p>
+</div>
+
+<h2 id="results"><span class="eyebrow">Summary</span>Results and costs</h2>
+
+<h3>Fused perception, GPU kernel time</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Case (C = 16)</th><th class="num">Forward, before → after</th><th class="num">Speedup</th><th class="num">Backward, before → after</th><th class="num">Speedup</th></tr></thead>
+  <tbody>
+    <tr><td>Disk seed</td><td class="num">2.45 → 0.43 ms</td><td class="num">5.74×</td><td class="num">2.15 → 0.34 ms</td><td class="num">6.34×</td></tr>
+    <tr><td>Uniform texture seed</td><td class="num">0.70 → 0.20 ms</td><td class="num">3.41×</td><td class="num">0.58 → 0.10 ms</td><td class="num">5.90×</td></tr>
+    <tr><td>Emoji targets</td><td class="num">0.26 → 0.10 ms</td><td class="num">2.56×</td><td class="num">0.24 → 0.05 ms</td><td class="num">4.59×</td></tr>
+    <tr><td>Texture targets</td><td class="num">0.70 → 0.20 ms</td><td class="num">3.48×</td><td class="num">0.61 → 0.09 ms</td><td class="num">6.49×</td></tr>
+    <tr class="total"><td>Average of the four</td><td class="num"></td><td class="num up">4.40×</td><td class="num"></td><td class="num up">6.13×</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="table-note">"Before" is the first fused version. With C = 32, the average speedups are 5.0× and 6.7×. With C = 4, they are 3.8× and 6.0×. In 3D, a dense ball gets 4.8× / 6.5×. A sparse 3D cube with about 4 particles per cell gets only 2.0× / 2.6× (1.3× / 2.0× with C = 32). The reason is that most lanes of each warp have no particle. The 3D training config used the particle mode before. On its ball seed, one training step with the fused grid code is about 2× faster than with the particle mode. Now the 3D config uses the grid mode too.</p>
+
+<h3>Training time, 300 updates</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Version</th><th class="num">Emoji fox</th><th class="num">Texture bubbly</th></tr></thead>
+  <tbody>
+    <tr><td>Original unfused operators, old splatting</td><td class="num">54.91 s</td><td class="num">33.37 s</td></tr>
+    <tr><td>First fused version (before)</td><td class="num">38.18 s</td><td class="num">24.64 s</td></tr>
+    <tr><td>Steps 1–5, old splatting</td><td class="num">35.73 s</td><td class="num">19.57 s</td></tr>
+    <tr class="total"><td>Steps 1–6</td><td class="num up">22.23 s</td><td class="num up">14.53 s</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="table-note">We averaged two targets per family. The final version trains 2.42× (emoji) and 2.26× (texture) faster than the original unfused code. It is 1.68× faster than the first fused version. Later, VGG batching in the texture loss (now always on) brought bubbly to 13.99 s.</p>
+
+<h3>What it cost</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Cost</th><th class="num">Before</th><th class="num">After</th></tr></thead>
+  <tbody>
+    <tr><td>Compile time, SM89 only</td><td class="num">71 s</td><td class="num">80 s</td></tr>
+    <tr><td>Compile time, default four architectures</td><td class="num">162 s</td><td class="num">182 s</td></tr>
+    <tr><td>Peak compiler memory</td><td class="num">3.0 GB</td><td class="num">3.4 GB</td></tr>
+    <tr><td>Library size, four architectures</td><td class="num">14.1 MB</td><td class="num">12.1 MB</td></tr>
+    <tr><td>Peak training memory, emoji / texture</td><td class="num">4.44 / 2.47 GiB</td><td class="num">4.71 / 2.40 GiB</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="table-note">The library got smaller because the <code>-rdc</code> linking is gone. It is smaller even though it now also contains PTX (the old build lost the PTX by mistake). The machine code of the fused kernels is also about 50% larger, because of unrolling. Emoji training uses more memory, because batched splatting keeps the kernel taps of all samples at the same time.</p>
+
+<h2 id="checklist"><span class="eyebrow">Takeaways</span>Checklist for your next kernel</h2>
+
+<ol class="checklist">
+  <li><strong>Look for structure that the data already has.</strong> Particles in one grid block share one list of candidates. This one fact made broadcast reads possible.</li>
+  <li><strong>Count instructions per unit of useful work.</strong> Also check how many lanes are active. Work that many threads repeat, like the same pair weights for 16 channels, shows up in the first number. Idle lanes show up in the second.</li>
+  <li><strong>After you remove work, check the parallelism again.</strong> Low occupancy with few warps per SM means nothing hides the waiting time. Split the sum across warps.</li>
+  <li><strong>Check registers and spills with the real build flags.</strong> Use <code>__launch_bounds__</code> with a minimum block count, <code>-Xptxas -v</code>, and <code>cuobjdump</code>.</li>
+  <li><strong>Reuse what an earlier pass already knows.</strong> The return value of <code>atomicAdd</code> is a free rank.</li>
+  <li><strong>When the kernels are fast, profile the host.</strong> Count kernel launches and tensor conversions per step. Look for hidden syncs, like boolean-mask indexing or <code>.item()</code>.</li>
+  <li><strong>Test in layers.</strong> Bitwise where the order allows it, tolerances against a reference everywhere, sanitizers for memory and races, and matched training compared with the noise of the old code.</li>
+</ol>
+
+<h2 id="files"><span class="eyebrow">Reference</span>Where to find things</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Path</th><th style="text-align:left">What is there</th></tr></thead>
+  <tbody>
+    <tr><td><code>sphops/fused_perception.cuh</code></td><td style="text-align:left">fused kernels, warp-team layout, tuning constants</td></tr>
+    <tr><td><code>sphops/sph_cuda.cu</code></td><td style="text-align:left">grid build, original operators, <code>fused_perception_forward/backward</code></td></tr>
+    <tr><td><code>sphops/sph.py</code></td><td style="text-align:left"><code>FusedPerception</code>, <code>fused_perception</code>, <code>perception</code>, <code>HashGrid</code></td></tr>
+    <tr><td><code>sphops/testing/</code></td><td style="text-align:left">tests, benchmarks, PyTorch reference, profiling script</td></tr>
+    <tr><td><code>sphops/FUSED_PERCEPTION.md</code></td><td style="text-align:left">API and design notes</td></tr>
+    <tr><td><code>sphops/BENCHMARKS.md</code></td><td style="text-align:left">commands and all result tables</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="code-block">
+<div class="code-label">Run the checks (from the repository root)</div>
+<pre><code>python3 -m sphops.testing.test_perception --gpu     <span class="c"># fused perception</span>
+python3 -m sphops.testing.test_pipeline --gpu       <span class="c"># batched splatting, compiled step</span>
+python3 -m sphops.testing.test                      <span class="c"># standalone SPH operators</span>
+python3 -m sphops.testing.benchmark --channels 16 --operations perception npa \
+  --block-caps 32 --output results/sph_benchmark.json</code></pre>
+</div>
+
+</article>
+</div>
+</body>
+</html>

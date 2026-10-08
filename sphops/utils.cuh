@@ -19,34 +19,6 @@ struct ParticlePosition<2>
 {
     float2 pos; // Position (x, y)
 
-    __device__ __host__ ParticlePosition<2> operator+(const ParticlePosition<2> &other) const
-    {
-        // return __fadd2_rn(pos, other.pos);
-        return {make_float2(pos.x + other.pos.x, pos.y + other.pos.y)};
-    }
-
-    __device__ __host__ ParticlePosition<2> operator-(const ParticlePosition<2> &other) const
-    {
-        // return {__fadd2_rn(pos, make_float2(-other.pos.x, -other.pos.y))};
-        return {make_float2(pos.x - other.pos.x, pos.y - other.pos.y)};
-    }
-
-    __device__ __host__ ParticlePosition<2> &operator+=(const ParticlePosition<2> &other)
-    {
-        // this.pos = __fadd2_rn(this.pos, other.pos);
-        pos.x += other.pos.x;
-        pos.y += other.pos.y;
-        return *this;
-    }
-
-    __device__ __host__ ParticlePosition<2> &operator-=(const ParticlePosition<2> &other)
-    {
-        // this.pos = __fadd2_rn(this.pos, make_float2(-other.pos.x, -other.pos.y));
-        pos.x -= other.pos.x;
-        pos.y -= other.pos.y;
-        return *this;
-    }
-
     // Allow access via index [uint32_t dim_idx] for generic programming
     __device__ __host__ float operator[](uint32_t dim_idx) const
     {
@@ -65,33 +37,7 @@ struct ParticlePosition<2>
 template <>
 struct ParticlePosition<3>
 {
-    float4 pos; // Position (x, y, z, w) - w can be unused or store extra data
-
-    __device__ __host__ ParticlePosition<3> operator+(const ParticlePosition<3> &other) const
-    {
-        return {make_float4(pos.x + other.pos.x, pos.y + other.pos.y, pos.z + other.pos.z, 0.0f)};
-    }
-
-    __device__ __host__ ParticlePosition<3> operator-(const ParticlePosition<3> &other) const
-    {
-        return {make_float4(pos.x - other.pos.x, pos.y - other.pos.y, pos.z - other.pos.z, 0.0f)};
-    }
-
-    __device__ __host__ ParticlePosition<3> &operator+=(const ParticlePosition<3> &other)
-    {
-        pos.x += other.pos.x;
-        pos.y += other.pos.y;
-        pos.z += other.pos.z;
-        return *this;
-    }
-
-    __device__ __host__ ParticlePosition<3> &operator-=(const ParticlePosition<3> &other)
-    {
-        pos.x -= other.pos.x;
-        pos.y -= other.pos.y;
-        pos.z -= other.pos.z;
-        return *this;
-    }
+    float3 pos; // Position (x, y, z)
 
     // Allow access via index [uint32_t dim_idx] for generic programming
     __device__ __host__ float operator[](uint32_t dim_idx) const
@@ -133,54 +79,6 @@ __device__ inline float read_mass(const float *mass, uint32_t particle_count, ui
 
 __device__ __forceinline__ float pow2(float x) { return x * x; }
 __device__ __forceinline__ float pow3(float x) { return x * x * x; }
-__device__ __forceinline__ float pow4(float x)
-{
-    float x2 = x * x;
-    return x2 * x2;
-}
-__device__ __forceinline__ float pow5(float x)
-{
-    float x2 = x * x;
-    return x2 * x2 * x;
-}
-__device__ __forceinline__ float pow6(float x)
-{
-    float x2 = x * x;
-    float x3 = x2 * x;
-    return x3 * x3;
-}
-__device__ __forceinline__ float pow8(float x)
-{
-    float x2 = x * x;
-    float x4 = x2 * x2;
-    return x4 * x4;
-}
-
-__device__ __forceinline__ float pow9(float x)
-{
-    float x2 = x * x;
-    float x4 = x2 * x2;
-    return x4 * x4 * x;
-}
-
-template <int DIM>
-__device__ inline float l2_distance(const ParticlePosition<DIM> &a, const ParticlePosition<DIM> &b)
-{
-    if constexpr (DIM == 2)
-    {
-        float dx = a.pos.x - b.pos.x;
-        float dy = a.pos.y - b.pos.y;
-        return dx * dx + dy * dy;
-    }
-    else if constexpr (DIM == 3)
-    {
-        float dx = a.pos.x - b.pos.x;
-        float dy = a.pos.y - b.pos.y;
-        float dz = a.pos.z - b.pos.z;
-        return dx * dx + dy * dy + dz * dz;
-    }
-    return 0.0f; // Should never reach here
-}
 
 template <int DIM>
 __device__ inline float dot(const ParticlePosition<DIM> &a, const ParticlePosition<DIM> &b)
@@ -285,11 +183,9 @@ enum class BoundaryCondition
     PERIODIC = 1
 };
 
-enum class KernelStrategy
-{
-    GridBased,    // Advanced: Block-per-cell with shared memory
-    ParticleBased // Vanilla: Thread-per-particle with registers
-};
+// Positions are read and written in place as contiguous (B, N, DIM) float tensors.
+static_assert(sizeof(ParticlePosition<2>) == 2 * sizeof(float), "2D positions must be two packed floats");
+static_assert(sizeof(ParticlePosition<3>) == 3 * sizeof(float), "3D positions must be three packed floats");
 
 // Add these member variables to the HashGrid class
 struct BlockInfo
@@ -300,7 +196,58 @@ struct BlockInfo
     uint32_t batch_idx;      // Which batch this block belongs to
 };
 
-template <int DIM, BoundaryCondition BC, KernelStrategy ST>
+// In-place inverse of a symmetric DIM x DIM matrix (row-major, full storage).
+// Near-singular matrices (|det| < tolerance) become the identity: isolated or
+// degenerate neighborhoods get no moment correction instead of an unstable one.
+// Shared by gradient_hybrid's safe_inv_sym_mat and the fused forward kernel.
+template <int DIM>
+__device__ __forceinline__ void safe_inverse_symmetric(float *matrix, float tolerance)
+{
+    if constexpr (DIM == 2)
+    {
+        float a = matrix[0], b = matrix[1], d = matrix[3];
+        float det = a * d - b * b;
+        if (fabsf(det) < tolerance)
+        {
+            matrix[0] = matrix[3] = 1.0f;
+            matrix[1] = matrix[2] = 0.0f;
+        }
+        else
+        {
+            float inv_det = 1.0f / det;
+            matrix[0] = d * inv_det;
+            matrix[1] = matrix[2] = -b * inv_det;
+            matrix[3] = a * inv_det;
+        }
+    }
+    else
+    {
+        float a = matrix[0], b = matrix[1], c = matrix[2];
+        float d = matrix[4], e = matrix[5], f = matrix[8];
+        float t1 = d * f - e * e;
+        float t2 = c * e - b * f;
+        float t3 = b * e - c * d;
+        float det = a * t1 + b * t2 + c * t3;
+        if (fabsf(det) < tolerance)
+        {
+            #pragma unroll
+            for (int k = 0; k < 9; ++k)
+                matrix[k] = k % 4 == 0 ? 1.0f : 0.0f;
+        }
+        else
+        {
+            float inv_det = 1.0f / det;
+            matrix[0] = t1 * inv_det;
+            matrix[1] = matrix[3] = t2 * inv_det;
+            matrix[2] = matrix[6] = t3 * inv_det;
+            matrix[4] = (a * f - c * c) * inv_det;
+            matrix[5] = matrix[7] = (b * c - a * e) * inv_det;
+            matrix[8] = (a * d - b * b) * inv_det;
+        }
+    }
+}
+
+template <int DIM, BoundaryCondition BC>
 struct GridConfig
 {
     int grid_size[DIM];      // Grid resolution in each dimension
@@ -317,17 +264,17 @@ struct GridConfig
     float default_mass;
     float L[DIM];
     float half_L[DIM];
+    float inv_L[DIM];
 
     __device__ inline float wrap_periodic(float d, uint32_t dim_idx) const
     {
-        // Wrap displacement into [-L/2, L/2) where L = grid_size[dim] * eps
+        // Wrap displacement into [-L/2, L/2] where L = grid_size[dim] * eps:
+        // subtract the nearest whole number of periods (one round-to-nearest,
+        // one fma; a displacement already inside the range is returned exactly).
         float Ld = L[dim_idx];
         if (Ld <= 0.0f)
             return d;
-        float t = fmodf(d + half_L[dim_idx], Ld);
-        if (t < 0.0f)
-            t += Ld;
-        return t - half_L[dim_idx];
+        return fmaf(-rintf(d * inv_L[dim_idx]), Ld, d);
     }
 
     __device__ inline ParticlePosition<DIM> displacement(const ParticlePosition<DIM> &from,
@@ -356,7 +303,7 @@ struct GridConfig
                 dy = wrap_periodic(dy, 1);
                 dz = wrap_periodic(dz, 2);
             }
-            r.pos = make_float4(dx, dy, dz, 0.0f);
+            r.pos = make_float3(dx, dy, dz);
         }
         return r;
     }
@@ -369,10 +316,7 @@ struct GridConfig
 
     __device__ inline int positive_mod(int i, int n) const
     {
-        if constexpr (ST == KernelStrategy::ParticleBased)
-            return i & (n - 1); // n must be power of two
-        else
-            return is_pow2 ? i & (n - 1) : (i % n + n) % n;
+        return is_pow2 ? i & (n - 1) : (i % n + n) % n;
     }
 
     __device__ inline bool is_in_bound(int *cell_idx) const
@@ -439,87 +383,100 @@ struct GridConfig
         apply_boundary(cell_idx);
     }
 
+    // Cell index (within a batch) of a position.
+    __device__ inline uint32_t cell_hash(const ParticlePosition<DIM> &particle) const
+    {
+        int cell[DIM];
+        pos2cell(particle, cell);
+        return cell2hash(cell);
+    }
+
     __device__ inline uint32_t cell2hash(const int *cell_idx) const
     {
-        if constexpr (DIM == 2 && ST == KernelStrategy::GridBased)
+        if constexpr (DIM == 2)
             return static_cast<uint32_t>(cell_idx[1] * grid_size[0] + cell_idx[0]);
-        else if constexpr (DIM == 3 && ST == KernelStrategy::GridBased)
+        else
             return static_cast<uint32_t>((cell_idx[2] * grid_size[1] + cell_idx[1]) * grid_size[0] + cell_idx[0]);
-        else if constexpr (DIM == 2 && ST == KernelStrategy::ParticleBased)
-            return static_cast<uint32_t>(dilate(cell_idx[0]) | (dilate(cell_idx[1]) << 1));
-        else if constexpr (DIM == 3 && ST == KernelStrategy::ParticleBased)
-            return static_cast<uint32_t>(dilate(cell_idx[0]) | (dilate(cell_idx[1]) << 1) | (dilate(cell_idx[2]) << 2));
-        return 0; // Should never reach here
     }
 
     __device__ inline void hash2cell(uint32_t hash, int *cell_idx) const
     {
-        if constexpr (DIM == 2 && ST == KernelStrategy::GridBased)
+        if constexpr (DIM == 2)
         {
             cell_idx[0] = hash % grid_size[0];
             cell_idx[1] = hash / grid_size[0];
         }
-        else if constexpr (DIM == 3 && ST == KernelStrategy::GridBased)
+        else
         {
             cell_idx[0] = hash % grid_size[0];
             cell_idx[1] = (hash / grid_size[0]) % grid_size[1];
             cell_idx[2] = hash / (grid_size[0] * grid_size[1]);
         }
-        else if constexpr (DIM == 2 && ST == KernelStrategy::ParticleBased)
-        {
-            cell_idx[0] = undilate(hash) & (grid_size[0] - 1);      // grid_size should be power of two
-            cell_idx[1] = undilate(hash >> 1) & (grid_size[1] - 1); // grid_size should be power of two
-        }
-        else if constexpr (DIM == 3 && ST == KernelStrategy::ParticleBased)
-        {
-            cell_idx[0] = undilate(hash) & (grid_size[0] - 1);      // grid_size should be power of two
-            cell_idx[1] = undilate(hash >> 1) & (grid_size[1] - 1); // grid_size should be power of two
-            cell_idx[2] = undilate(hash >> 2) & (grid_size[2] - 1); // grid_size should be power of two
-        }
     }
 
-    __device__ inline int dilate(int x) const
+    // Neighbor cells of a cell, visited as NEIGHBOR_ROWS rows of three
+    // x-adjacent cells. Cells are x-fastest in the bin offsets, so each row is
+    // one contiguous span of binned particles; at a periodic x seam the wrapped
+    // cell is a second, disjoint chunk (wrap_chunk = 1). Spans contain
+    // candidates outside the kernel support.
+    static constexpr int NEIGHBOR_ROWS = DIM == 2 ? 3 : 9;
+    static constexpr int WRAP_CHUNKS = BC == BoundaryCondition::PERIODIC ? 2 : 1;
+
+    // The y (and z) coordinates of neighbor row `row` of `cell`, with the
+    // boundary applied; false if the row lies outside a clamped grid.
+    __device__ __forceinline__ bool neighbor_row(const int *cell, int row, int *neighbor) const
     {
+        neighbor[0] = cell[0];
         if constexpr (DIM == 2)
+            neighbor[1] = cell[1] + row - 1;
+        else
         {
-            x = x & 0x3FF;
-            x = (x | (x << 16)) & 0x0000FFFF; // 16 bit gap
-            x = (x | (x << 8)) & 0x00FF00FF;  // 8 bit gap
-            x = (x | (x << 4)) & 0x0F0F0F0F;  // 4 bit gap
-            x = (x | (x << 2)) & 0x33333333;  // 2 bit gap
-            x = (x | (x << 1)) & 0x55555555;  // 1 bit gap
+            neighbor[1] = cell[1] + row / 3 - 1;
+            neighbor[2] = cell[2] + row % 3 - 1;
         }
-        else if constexpr (DIM == 3)
-        {
-            x = x & 0x3FF;
-            x = (x | (x << 16)) & 0x030000FF; // 16 bit gap (keep low 8 bits + 2 high bits)
-            x = (x | (x << 8)) & 0x0300F00F;  // 8 bit gap
-            x = (x | (x << 4)) & 0x030C30C3;  // 4 bit gap
-            x = (x | (x << 2)) & 0x09249249;  // 2 bit gap (final pattern)
-        }
-        return x;
+        if (!is_in_bound(neighbor))
+            return false;
+        apply_boundary(neighbor);
+        return true;
     }
 
-    __device__ inline int undilate(int x) const
+    // x range [first_x, last_x] of one chunk of a neighbor row: the (up to)
+    // three adjacent cells, or the wrapped cell at a periodic seam; false if
+    // the chunk does not exist.
+    __device__ __forceinline__ bool row_x_range(const int *cell, int wrap_chunk, int &first_x, int &last_x) const
     {
-        if constexpr (DIM == 2)
+        if (wrap_chunk != 0)
         {
-            x = x & 0x55555555;
-            x = (x | (x >> 1)) & 0x33333333;
-            x = (x | (x >> 2)) & 0x0F0F0F0F;
-            x = (x | (x >> 4)) & 0x00FF00FF;
-            x = (x | (x >> 8)) & 0x0000FFFF;
-            x = (x | (x >> 16)) & 0x000003FF; // keep only 10 bits (max index = 1023)
+            if (cell[0] == 0)
+                first_x = last_x = grid_size[0] - 1;
+            else if (cell[0] == grid_size[0] - 1)
+                first_x = last_x = 0;
+            else
+                return false;
         }
-        else if constexpr (DIM == 3)
+        else
         {
-            x = x & 0x09249249;
-            x = (x | (x >> 2)) & 0x030C30C3;
-            x = (x | (x >> 4)) & 0x0300F00F;
-            x = (x | (x >> 8)) & 0x030000FF;
-            x = (x | (x >> 16)) & 0x000003FF; // keep only 10 bits
+            first_x = max(0, cell[0] - 1);
+            last_x = min(grid_size[0] - 1, cell[0] + 1);
         }
-        return x;
+        return true;
+    }
+
+    // Binned particles [start, end) of one chunk of a neighbor row, indexed over
+    // all batches; false for an absent or empty chunk.
+    __device__ __forceinline__ bool neighbor_span(const int *cell, unsigned int batch, int row, int wrap_chunk,
+                                                  const uint32_t *bin_offsets, uint32_t &start, uint32_t &end) const
+    {
+        int neighbor[DIM], first_x, last_x;
+        if (!neighbor_row(cell, row, neighbor) || !row_x_range(cell, wrap_chunk, first_x, last_x))
+            return false;
+        neighbor[0] = first_x;
+        unsigned int first = cell2hash(neighbor);
+        neighbor[0] = last_x;
+        unsigned int last = cell2hash(neighbor);
+        start = bin_offsets[batch * cell_count + first];
+        end = bin_offsets[batch * cell_count + last + 1];
+        return start != end;
     }
 };
 

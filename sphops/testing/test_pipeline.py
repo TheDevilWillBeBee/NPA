@@ -85,14 +85,14 @@ class TexturePipelineTests(unittest.TestCase):
 
 
 class CPUUpdateTests(unittest.TestCase):
-    def test_tensor_only_update_matches_eager_including_noise_and_padding(self):
+    def test_tensor_only_update_matches_eager_including_noise(self):
         from models.npa import NPA, step_euler
         for dim, intermediate, probability, noise_std in itertools.product(
                 (2, 3), (False, True), (0.5, 1.0), (0.0, 0.02)):
             with self.subTest(dim=dim, intermediate=intermediate, probability=probability, noise=noise_std):
                 torch.manual_seed(8)
                 model = NPA(spatial_dims=dim, state_dims=5, hidden_dims=16)
-                x = torch.randn(2, 7, 2 if dim == 2 else 4, requires_grad=True)
+                x = torch.randn(2, 7, dim, requires_grad=True)
                 state = torch.randn(2, 7, 5, requires_grad=True)
                 z = torch.randn(2, 7, model.perception_dim, requires_grad=True)
                 snapshot = object()
@@ -241,7 +241,7 @@ class CUDAPipelineTests(unittest.TestCase):
         torch.manual_seed(7)
         model = NPA(spatial_dims=3, state_dims=4, hidden_dims=16).cuda()
         z = torch.randn(1, 17, model.perception_dim, device="cuda", requires_grad=True)
-        x = torch.randn(1, 17, 4, device="cuda", requires_grad=True)
+        x = torch.randn(1, 17, 3, device="cuda", requires_grad=True)
         s = torch.randn(1, 17, 4, device="cuda", requires_grad=True)
         mask = torch.rand(1, 17, 1, device="cuda")
         noise = torch.randn_like(x)

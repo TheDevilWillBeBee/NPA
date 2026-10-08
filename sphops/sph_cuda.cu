@@ -3,9 +3,12 @@
 #include <nanobind/stl/optional.h>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
 #include <stdexcept>
+#include <map>
 #include "utils.cuh"
-#include "perception.cuh"
+#include "fused_perception.cuh"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -31,16 +34,27 @@ using BlockInfoArray = nb::ndarray<int32_t, nb::shape<-1, 4>, nb::c_contig, nb::
         }                                                                             \
     } while (0)
 
+// The two counting-sort prefix sums (cell counts and blocks per cell) run as
+// one scan over zipped pairs.
+using CounterPair = thrust::tuple<uint32_t, uint32_t>;
+struct CounterPairSum
+{
+    __host__ __device__ CounterPair operator()(const CounterPair &a, const CounterPair &b) const
+    {
+        return thrust::make_tuple(thrust::get<0>(a) + thrust::get<0>(b), thrust::get<1>(a) + thrust::get<1>(b));
+    }
+};
+
 // Counting pass of the counting sort. Each particle's arrival rank within its
 // cell is kept in the permutation buffer, so the scatter pass needs no second
 // set of atomics (the order within a cell is arbitrary in either case).
-template <int DIM, BoundaryCondition BC, KernelStrategy ST>
+template <int DIM, BoundaryCondition BC>
 __global__ void grid_count_particles(
     const ParticlePosition<DIM> * __restrict__ positions,
     uint32_t * __restrict__ cell_counts,
     uint32_t * __restrict__ blocks_per_cell,
     uint32_t * __restrict__ rank_in_cell,
-    GridConfig<DIM, BC, ST> config)
+    GridConfig<DIM, BC> config)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t batch_idx = blockIdx.y;
@@ -50,28 +64,22 @@ __global__ void grid_count_particles(
     if (batch_idx >= config.batch_size)
         return;
 
-    ParticlePosition<DIM> pos = positions[idx];
-
-    int cell[DIM];
-    config.pos2cell(pos, cell);
-    uint32_t hash = config.cell2hash(cell);
-    uint32_t cell_idx = batch_idx * config.cell_count + hash;
+    uint32_t cell_idx = batch_idx * config.cell_count + config.cell_hash(positions[idx]);
 
     uint32_t prev_count = atomicAdd(&cell_counts[cell_idx], 1U);
     rank_in_cell[idx] = prev_count;
-    if constexpr (ST == KernelStrategy::GridBased)
-        if (prev_count % config.MAX_PARTICLES_PER_BLOCK == 0)
-            atomicAdd(&blocks_per_cell[cell_idx], 1U);
+    if (prev_count % config.MAX_PARTICLES_PER_BLOCK == 0)
+        atomicAdd(&blocks_per_cell[cell_idx], 1U);
 }
 
 // Scatter pass: permutation[idx] holds the rank from grid_count_particles on
 // entry and the particle's binned index within its batch on exit.
-template <int DIM, BoundaryCondition BC, KernelStrategy ST>
+template <int DIM, BoundaryCondition BC>
 __global__ void grid_compute_permutation(
     const ParticlePosition<DIM> * __restrict__ positions,
     const uint32_t * __restrict__ bin_offsets,
     uint32_t * __restrict__ permutation,
-    GridConfig<DIM, BC, ST> config)
+    GridConfig<DIM, BC> config)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t batch_idx = blockIdx.y;
@@ -81,15 +89,58 @@ __global__ void grid_compute_permutation(
     if (batch_idx >= config.batch_size)
         return;
 
-    ParticlePosition<DIM> pos = positions[idx];
-
-    int cell[DIM];
-    config.pos2cell(pos, cell);
-    uint32_t hash = config.cell2hash(cell);
+    uint32_t hash = config.cell_hash(positions[idx]);
     permutation[idx] += bin_offsets[batch_idx * config.cell_count + hash] - batch_idx * config.particle_count;
 }
 
-template <int DIM, BoundaryCondition BC, KernelStrategy ST>
+// Copies one row of `width` floats, as float4 when width is a multiple of 4.
+__device__ __forceinline__ void copy_row(float *__restrict__ dst, const float *__restrict__ src, uint32_t width)
+{
+    if ((width & 3) == 0)
+    {
+        for (uint32_t f = 0; f < width; f += 4)
+            reinterpret_cast<float4 *>(dst)[f >> 2] = reinterpret_cast<const float4 *>(src)[f >> 2];
+    }
+    else
+    {
+        for (uint32_t f = 0; f < width; ++f)
+            dst[f] = src[f];
+    }
+}
+
+// Scatter pass of the fused path: the binned index of grid_compute_permutation,
+// and the particle copied to it as apply_permutation does, in one kernel.
+template <int DIM, BoundaryCondition BC>
+__global__ void grid_scatter_and_bin(
+    const ParticlePosition<DIM> * __restrict__ positions,
+    const float * __restrict__ input_state,
+    const float * __restrict__ input_mass,
+    const uint32_t * __restrict__ bin_offsets,
+    uint32_t * __restrict__ permutation,
+    ParticlePosition<DIM> * __restrict__ output_positions,
+    float * __restrict__ output_state,
+    float * __restrict__ output_mass,
+    uint32_t feature_dim,
+    GridConfig<DIM, BC> config)
+{
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t batch_idx = blockIdx.y;
+    uint32_t idx = batch_idx * config.particle_count + tid;
+    if (tid >= config.particle_count || batch_idx >= config.batch_size)
+        return;
+
+    ParticlePosition<DIM> position = positions[idx];
+    uint32_t hash = config.cell_hash(position);
+    uint32_t binned = permutation[idx] + bin_offsets[batch_idx * config.cell_count + hash] - batch_idx * config.particle_count;
+    permutation[idx] = binned;
+    uint32_t permuted_idx = binned + batch_idx * config.particle_count;
+    output_positions[permuted_idx] = position;
+    if (input_mass != nullptr)  // Optional: unit masses need no binning.
+        output_mass[permuted_idx] = input_mass[idx];
+    copy_row(&output_state[permuted_idx * feature_dim], &input_state[idx * feature_dim], feature_dim);
+}
+
+template <int DIM, BoundaryCondition BC>
 __global__ void apply_permutation(
     const ParticlePosition<DIM> * __restrict__ input_positions,
     const float * __restrict__ input_state,
@@ -99,7 +150,7 @@ __global__ void apply_permutation(
     float * __restrict__ output_state,
     float * __restrict__ output_mass,
     uint32_t feature_dim,
-    GridConfig<DIM, BC, ST> config)
+    GridConfig<DIM, BC> config)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t batch_idx = blockIdx.y;
@@ -113,26 +164,13 @@ __global__ void apply_permutation(
     output_positions[permuted_idx] = input_positions[idx];
     if (input_mass != nullptr)  // Optional: unit masses need no binning.
         output_mass[permuted_idx] = input_mass[idx];
-    uint32_t f = 0;
-    // Vectorized float4 fast path when feature_dim is a multiple of 4
-    if ((feature_dim & 3) == 0)
-    {
-        const float4 *src4 = reinterpret_cast<const float4 *>(&input_state[idx * feature_dim]);
-        float4 *dst4 = reinterpret_cast<float4 *>(&output_state[permuted_idx * feature_dim]);
-        for (; f < feature_dim; f += 4)
-            dst4[f >> 2] = src4[f >> 2];
-    }
-    else
-    {
-        for (; f < feature_dim; ++f)
-            output_state[permuted_idx * feature_dim + f] = input_state[idx * feature_dim + f];
-    }
+    copy_row(&output_state[permuted_idx * feature_dim], &input_state[idx * feature_dim], feature_dim);
 }
 
 // Gather cotangents back to the original particle order. Position and mass
 // cotangents are optional (nullptr). An optional second binned state cotangent
 // is summed in the same pass, as autograd would accumulate the two.
-template <int DIM, BoundaryCondition BC, KernelStrategy ST>
+template <int DIM, BoundaryCondition BC>
 __global__ void backward_apply_permutation(
     const ParticlePosition<DIM> * __restrict__ grad_output_positions,
     const float * __restrict__ grad_output_state,
@@ -142,7 +180,7 @@ __global__ void backward_apply_permutation(
     float * __restrict__ grad_input_state,
     float * __restrict__ grad_input_mass,
     uint32_t feature_dim,
-    GridConfig<DIM, BC, ST> config,
+    GridConfig<DIM, BC> config,
     const float * __restrict__ grad_output_state_addend = nullptr)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -156,50 +194,59 @@ __global__ void backward_apply_permutation(
 
     uint32_t permuted_idx = permutation[idx] + batch_idx * config.particle_count;
 
-    // Backward pass for positions: grad_input_positions[idx] = grad_output_positions[permuted_idx]
     if (grad_output_positions != nullptr)
         grad_input_positions[idx] = grad_output_positions[permuted_idx];
     if (grad_output_mass != nullptr)
         grad_input_mass[idx] = grad_output_mass[permuted_idx];
 
-    // Backward pass for state: grad_input_state[idx * feature_dim + f] = grad_output_state[permuted_idx * feature_dim + f]
     if (grad_output_state == nullptr)
         return;
-    uint32_t f = 0;
     const float *src = &grad_output_state[permuted_idx * feature_dim];
     float *dst = &grad_input_state[idx * feature_dim];
     if (grad_output_state_addend != nullptr)
     {
         const float *addend = &grad_output_state_addend[permuted_idx * feature_dim];
-        for (; f < feature_dim; ++f)
-            dst[f] = src[f] + addend[f];
-    }
-    // Vectorized float4 fast path when feature_dim is a multiple of 4
-    else if ((feature_dim & 3) == 0)
-    {
-        const float4 *src4 = reinterpret_cast<const float4 *>(src);
-        float4 *dst4 = reinterpret_cast<float4 *>(dst);
-        for (; f < feature_dim; f += 4)
-            dst4[f >> 2] = src4[f >> 2];
+        if ((feature_dim & 3) == 0)
+        {
+            for (uint32_t f = 0; f < feature_dim; f += 4)
+            {
+                float4 a = reinterpret_cast<const float4 *>(src)[f >> 2];
+                float4 b = reinterpret_cast<const float4 *>(addend)[f >> 2];
+                reinterpret_cast<float4 *>(dst)[f >> 2] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+            }
+        }
+        else
+            for (uint32_t f = 0; f < feature_dim; ++f)
+                dst[f] = src[f] + addend[f];
     }
     else
-    {
-        for (; f < feature_dim; ++f)
-            dst[f] = src[f];
-    }
+        copy_row(dst, src, feature_dim);
 }
-// Kernel to assign block information
-template <int DIM, BoundaryCondition BC, KernelStrategy ST = KernelStrategy::GridBased>
+
+// One entry per grid block: its cell, offset within the cell, particle count and batch.
+template <int DIM, BoundaryCondition BC>
 __global__ void assign_block_info(
     const uint32_t * __restrict__ cell_counts,   // Shape [batch_size * cell_count]
     const uint32_t * __restrict__ block_offsets, // Cumulative sum of blocks per cell (batch_size * cell_count + 1)
     BlockInfo * __restrict__ block_info,         // Output: block information # Shape [batch_size * max_blocks_per_batch]
-    GridConfig<DIM, BC, ST> config)
+    GridConfig<DIM, BC> config)
 {
     uint32_t cell_idx = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t batch_idx = blockIdx.y;
 
-    if (cell_idx >= config.cell_count || batch_idx >= config.batch_size)
+    if (batch_idx >= config.batch_size)
+        return;
+
+    // The launch covers max_blocks records; the unused tail after the last
+    // grid block becomes zero-count sentinels here instead of by a memset.
+    uint32_t total_blocks = block_offsets[config.batch_size * config.cell_count];
+    uint32_t max_blocks = config.max_blocks_per_batch * config.batch_size;
+    uint32_t threads = gridDim.x * blockDim.x * config.batch_size;
+    for (uint32_t i = total_blocks + (batch_idx * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
+         i < max_blocks; i += threads)
+        block_info[i] = BlockInfo{0u, 0u, 0u, 0u};
+
+    if (cell_idx >= config.cell_count)
         return;
 
     uint32_t global_cell_idx = batch_idx * config.cell_count + cell_idx;
@@ -228,6 +275,23 @@ __global__ void assign_block_info(
     }
 }
 
+// Splits a flat index over rows of `width` values into (row, column), with a
+// shift/mask path for power-of-two widths.
+struct RowSplit
+{
+    uint32_t width;
+    uint32_t shift = 0;
+    bool pow2;
+
+    __device__ explicit RowSplit(uint32_t width) : width(width), pow2((width & (width - 1)) == 0)
+    {
+        while ((1U << shift) < width)
+            shift++;
+    }
+    __device__ uint32_t row(uint32_t k) const { return pow2 ? k >> shift : k / width; }
+    __device__ uint32_t col(uint32_t k) const { return pow2 ? k & (width - 1) : k % width; }
+};
+
 enum class ComputationType
 {
     Count,           // 0
@@ -238,514 +302,8 @@ enum class ComputationType
     Gradient         // 5
 };
 
-template <int DIM, ComputationType COMP_TYPE, int MAX_FEATURES, BoundaryCondition BC = BoundaryCondition::PERIODIC, KernelStrategy ST = KernelStrategy::ParticleBased>
-__global__ void vanilla_forward_kernel(
-    const ParticlePosition<DIM> * __restrict__ position_in, // Shape (batch_size, N, DIM)
-    const float * __restrict__ rho_in,                      // Input density tensor, Shape (batch_size, N)
-    const float * __restrict__ mass_in,                     // Input mass tensor, Shape (batch_size, N)
-    const float * __restrict__ state_in,                    // Input state tensor, Shape (batch_size, N, feature_dim)
-    float * __restrict__ rho_out,                           // Output/Input density tensor, Shape (batch_size, N)
-    float * __restrict__ count_out,                         // Output count tensor, Shape (batch_size, N)
-    float * __restrict__ blur_state_out,                    // Output state tensor, Shape (batch_size, N, feature_dim)
-    float * __restrict__ grad_state_out,                    // Output state gradient tensor, Shape (batch_size, N, feature_dim, DIM)
-    float * __restrict__ grad_density_out,                  // Output density gradient tensor, Shape (batch_size, N, DIM)
-    float * __restrict__ moment_matrix_out,                 // Output moment matrix tensor, Shape (batch_size, N, DIM, DIM)
-    uint32_t feature_dim,                     // Number of features in state
-    const uint32_t * __restrict__ bin_offsets, // Shape (batch_size * cell_count + 1)
-    const GridConfig<DIM, BC, ST> config)
-{
-    uint32_t batch_idx = blockIdx.y;
-    uint32_t particle_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (particle_idx >= config.particle_count || batch_idx >= config.batch_size)
-        return;
-
-    constexpr int MEM_SIZE_LOCAL_STATE = (COMP_TYPE == ComputationType::Gradient) ? MAX_FEATURES : 1;
-    constexpr int MEM_SIZE_NEIGHBOR_STATE = (COMP_TYPE == ComputationType::Blur || COMP_TYPE == ComputationType::Gradient) ? MAX_FEATURES : 1;
-    constexpr int MEM_SIZE_LOCAL_BUFFER = []()
-    {
-        if constexpr (COMP_TYPE == ComputationType::Blur)
-            return MAX_FEATURES;
-        else if constexpr (COMP_TYPE == ComputationType::Gradient)
-            return MAX_FEATURES * DIM;
-        else if constexpr (COMP_TYPE == ComputationType::MomentMatrix)
-            return DIM * DIM;
-        else if constexpr (COMP_TYPE == ComputationType::DensityGradient)
-            return DIM;
-        else
-            return 1;
-    }();
-
-    float *global_output_buffer;
-    int output_dim;
-    float coef;
-    if constexpr (COMP_TYPE == ComputationType::Count)
-    {
-        global_output_buffer = &count_out[batch_idx * config.particle_count + particle_idx];
-        output_dim = 1;
-        coef = 1.0f;
-    }
-    else if constexpr (COMP_TYPE == ComputationType::Density)
-    {
-        global_output_buffer = &rho_out[batch_idx * config.particle_count + particle_idx];
-        output_dim = 1;
-        coef = config.smoothing_coef;
-    }
-    else if constexpr (COMP_TYPE == ComputationType::Blur)
-    {
-        global_output_buffer = &blur_state_out[(batch_idx * config.particle_count + particle_idx) * feature_dim];
-        output_dim = feature_dim;
-        coef = config.smoothing_coef;
-    }
-    else if constexpr (COMP_TYPE == ComputationType::Gradient)
-    {
-        global_output_buffer = &grad_state_out[(batch_idx * config.particle_count + particle_idx) * feature_dim * DIM];
-        output_dim = feature_dim * DIM;
-        coef = config.spiky_coef;
-    }
-    else if constexpr (COMP_TYPE == ComputationType::MomentMatrix)
-    {
-        global_output_buffer = &moment_matrix_out[(batch_idx * config.particle_count + particle_idx) * DIM * DIM];
-        output_dim = DIM * DIM;
-        coef = config.spiky_coef;
-    }
-    else if constexpr (COMP_TYPE == ComputationType::DensityGradient)
-    {
-        global_output_buffer = &grad_density_out[(batch_idx * config.particle_count + particle_idx) * DIM];
-        output_dim = DIM;
-        coef = config.spiky_coef;
-    }
-
-    constexpr int chunk_types = []()
-    {
-        if constexpr (BC == BoundaryCondition::PERIODIC)
-            return 2;
-        else
-            return 1;
-    }();
-    constexpr int NUM_NEIGHBOR_CELLS = (DIM == 2) ? 9 : 27;
-
-    float s_i[MEM_SIZE_LOCAL_STATE];
-    float s_j[MEM_SIZE_NEIGHBOR_STATE];
-    float local_output_buffer[MEM_SIZE_LOCAL_BUFFER] = {0.0f};
-    float rho_j, v_j; // Rho and specific volume for neighbor particle j
-    float m_j;
-    float default_mass = config.default_mass;
-    float eps2 = config.eps * config.eps;
-    ParticlePosition<DIM> p_i = read_position<DIM>(position_in, config.particle_count, batch_idx, particle_idx);
-
-    if constexpr (COMP_TYPE == ComputationType::Gradient)
-        for (uint32_t f = 0; f < feature_dim; ++f)
-            s_i[f] = read_state(state_in, config.particle_count, feature_dim, batch_idx, particle_idx, f);
-
-    int local_cell[DIM];
-    int neighbor_cell[DIM];
-    config.pos2cell(p_i, local_cell);
-    uint32_t local_cell_idx = config.cell2hash(local_cell);
-
-    // TODO: Switch to Morton Hashing for better memory access patterns
-    // Change GridConfig accordingly
-    for (int k = 0; k < NUM_NEIGHBOR_CELLS; k++)
-    {
-        if constexpr (DIM == 2)
-        {
-            neighbor_cell[0] = local_cell[0] + (k % 3 - 1);
-            neighbor_cell[1] = local_cell[1] + (k / 3 - 1);
-        }
-        else if constexpr (DIM == 3)
-        {
-            neighbor_cell[0] = local_cell[0] + (k % 3 - 1);
-            neighbor_cell[1] = local_cell[1] + ((k / 3) % 3 - 1);
-            neighbor_cell[2] = local_cell[2] + (k / 9 - 1);
-        }
-
-        if (!config.is_in_bound(neighbor_cell))
-            continue;
-
-        config.apply_boundary(neighbor_cell);
-        uint32_t neighbor_cell_idx = config.cell2hash(neighbor_cell);
-
-        uint32_t remote_start = bin_offsets[batch_idx * config.cell_count + neighbor_cell_idx] - batch_idx * config.particle_count;
-        uint32_t remote_end = bin_offsets[batch_idx * config.cell_count + neighbor_cell_idx + 1] - batch_idx * config.particle_count;
-        uint32_t remote_count = remote_end - remote_start;
-        if (remote_count == 0)
-            continue;
-
-        for (uint32_t j = 0; j < remote_count; ++j)
-        {
-            ParticlePosition<DIM> p_j = read_position<DIM>(position_in, config.particle_count, batch_idx, remote_start + j);
-            if (config.l2_distance(p_i, p_j) >= eps2)
-                continue;
-
-            if constexpr (COMP_TYPE == ComputationType::Blur || COMP_TYPE == ComputationType::Gradient || COMP_TYPE == ComputationType::MomentMatrix)
-            {
-                rho_j = read_state(rho_in, config.particle_count, 1, batch_idx, remote_start + j, 0);
-                m_j = read_mass(mass_in, config.particle_count, batch_idx, remote_start + j, default_mass);
-                v_j = m_j / rho_j;
-            }
-
-            if constexpr (COMP_TYPE == ComputationType::Blur || COMP_TYPE == ComputationType::Gradient)
-                for (uint32_t f = 0; f < feature_dim; ++f)
-                    s_j[f] = read_state(state_in, config.particle_count, feature_dim, batch_idx, remote_start + j, f);
-
-            if constexpr (COMP_TYPE == ComputationType::Count)
-                local_output_buffer[0] += 1.0f;
-
-            if constexpr (COMP_TYPE == ComputationType::Density)
-            {
-                m_j = read_mass(mass_in, config.particle_count, batch_idx, remote_start + j, default_mass);
-                ParticlePosition<DIM> r_ij = config.displacement(p_i, p_j);
-                local_output_buffer[0] += smoothing_kernel(r_ij, config.eps) * m_j;
-            }
-
-            if constexpr (COMP_TYPE == ComputationType::Blur)
-            {
-                ParticlePosition<DIM> r_ij = config.displacement(p_i, p_j);
-                float w = smoothing_kernel(r_ij, config.eps) * v_j;
-                for (uint32_t f = 0; f < feature_dim; ++f)
-                    local_output_buffer[f] += w * s_j[f];
-            }
-
-            if constexpr (COMP_TYPE == ComputationType::Gradient)
-            {
-                float w[DIM] = {0.0f};
-                ParticlePosition<DIM> r_ij = config.displacement(p_i, p_j);
-                spiky_kernel_inplace(r_ij, config.eps, v_j, w);
-                for (uint32_t f = 0; f < feature_dim; ++f)
-                    for (int d = 0; d < DIM; ++d)
-                        local_output_buffer[f * DIM + d] += w[d] * (s_j[f] - s_i[f]);
-            }
-
-            if constexpr (COMP_TYPE == ComputationType::DensityGradient)
-            {
-                m_j = read_mass(mass_in, config.particle_count, batch_idx, remote_start + j, default_mass);
-                ParticlePosition<DIM> r_ij = config.displacement(p_i, p_j);
-                spiky_kernel_inplace(r_ij, config.eps, m_j, &local_output_buffer[0]);
-            }
-
-            if constexpr (COMP_TYPE == ComputationType::MomentMatrix)
-            {
-                ParticlePosition<DIM> r_ij = config.displacement(p_i, p_j);
-                moment_matrix_inplace(r_ij, config.eps, v_j, &local_output_buffer[0]);
-            }
-        }
-    }
-
-    for (int i = 0; i < output_dim; ++i)
-        global_output_buffer[i] = local_output_buffer[i] * coef;
-}
-
-template <int DIM, ComputationType COMP_TYPE, int MAX_FEATURES,
-          BoundaryCondition BC = BoundaryCondition::PERIODIC,
-          KernelStrategy ST = KernelStrategy::GridBased,
-          bool COMPUTE_DS_ONLY = false>
-__global__ void vanilla_backward_kernel(
-    const ParticlePosition<DIM> * __restrict__ position_in, // Shape (batch_size, N, DIM)
-    const float * __restrict__ rho_in,                      // Input density tensor, Shape (batch_size, N)
-    const float * __restrict__ mass_in,                     // Input mass tensor, Shape (batch_size, N)
-    const float * __restrict__ state_in,                    // Input state tensor, Shape (batch_size, N, feature_dim)
-    const float * __restrict__ dL_rho_out,                  // Gradient of loss w.r.t. output density, Shape (batch_size, N)
-    const float * __restrict__ dL_count_out,                // Gradient of loss w.r.t. output count, Shape (batch_size, N)
-    const float * __restrict__ dL_blur_state_out,           // Gradient of loss w.r.t. output blurred state, Shape (batch_size, N, feature_dim)
-    const float * __restrict__ dL_grad_state_out,           // Gradient of loss w.r.t. output state gradient, Shape (batch_size, N, feature_dim, DIM)
-    const float * __restrict__ dL_grad_density_out,         // Gradient of loss w.r.t. output density gradient, Shape (batch_size, N, DIM)
-    const float * __restrict__ dL_moment_matrix_out,        // Gradient of loss w.r.t. output moment matrix, Shape (batch_size, N, DIM, DIM)
-    ParticlePosition<DIM> * __restrict__ dL_position_in,    // Gradient of loss w.r.t. input position, Shape (batch_size, N, DIM)
-    float * __restrict__ dL_rho_in,                         // Gradient of loss w.r.t. input density, Shape (batch_size, N)
-    float * __restrict__ dL_state_in,                       // Gradient of loss w.r.t. input state, Shape (batch_size, N, feature_dim)
-    uint32_t feature_dim,                     // Number of features in state
-    const uint32_t * __restrict__ bin_offsets, // Shape (batch_size * cell_count + 1)
-    const GridConfig<DIM, BC, ST> config)
-{
-    uint32_t batch_idx = blockIdx.y;
-    uint32_t particle_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (particle_idx >= config.particle_count || batch_idx >= config.batch_size)
-        return;
-
-    if constexpr (COMP_TYPE == ComputationType::Count)
-        return; // No gradients to compute for count
-
-    constexpr int MEM_SIZE_LOCAL_GRAD = []()
-    {
-        if constexpr (COMP_TYPE == ComputationType::Gradient)
-            return MAX_FEATURES * DIM;
-        else if constexpr (COMP_TYPE == ComputationType::Blur)
-            return COMPUTE_DS_ONLY ? 1 : MAX_FEATURES;
-        else if constexpr (COMP_TYPE == ComputationType::MomentMatrix)
-            return DIM * DIM;
-        else if constexpr (COMP_TYPE == ComputationType::DensityGradient)
-            return DIM;
-        else
-            return 1; // Density
-    }();
-
-    constexpr int MEM_SIZE_NEIGHBOR_GRAD = []()
-    {
-        if constexpr (COMP_TYPE == ComputationType::Gradient)
-            return MAX_FEATURES * DIM;
-        else if constexpr (COMP_TYPE == ComputationType::Blur)
-            return MAX_FEATURES;
-        else if constexpr (COMP_TYPE == ComputationType::MomentMatrix)
-            return DIM * DIM;
-        else if constexpr (COMP_TYPE == ComputationType::DensityGradient)
-            return DIM;
-        else
-            return 1;
-    }();
-
-    constexpr int MEM_SIZE_LOCAL_STATE = []()
-    {
-        if constexpr (COMP_TYPE == ComputationType::Blur || COMP_TYPE == ComputationType::Gradient)
-            return COMPUTE_DS_ONLY ? 1 : MAX_FEATURES;
-        else
-            return 1;
-    }();
-
-    constexpr int MEM_SIZE_NEIGHBOR_STATE = MEM_SIZE_LOCAL_STATE;
-
-    float grad_i[MEM_SIZE_LOCAL_GRAD];
-    float grad_j[MEM_SIZE_NEIGHBOR_GRAD];
-    float s_i[MEM_SIZE_LOCAL_STATE];
-    float s_j[MEM_SIZE_NEIGHBOR_STATE];
-    float v_i, v_j; // Specific volume (mass / density)
-    float m_i, m_j;
-    float default_mass = config.default_mass;
-    float eps2 = config.eps * config.eps;
-
-    float grad_x[DIM] = {0.0f}; // Gradient w.r.t. position
-    float grad_rho = 0.0f;      // Gradient w.r.t. density
-    float grad_s[MAX_FEATURES]; // Gradient w.r.t. state
-    for (uint32_t f = 0; f < feature_dim; ++f)
-        grad_s[f] = 0.0f;
-
-    int incoming_grad_buffer_dim;
-    const float *incoming_grad_buffer;
-    float coef;
-    if constexpr (COMP_TYPE == ComputationType::Density)
-    {
-        incoming_grad_buffer_dim = 1;
-        incoming_grad_buffer = dL_rho_out;
-        coef = config.smoothing_coef;
-    }
-    else if constexpr (COMP_TYPE == ComputationType::Blur)
-    {
-        incoming_grad_buffer_dim = feature_dim;
-        incoming_grad_buffer = dL_blur_state_out;
-        coef = config.smoothing_coef;
-    }
-    else if constexpr (COMP_TYPE == ComputationType::Gradient)
-    {
-        incoming_grad_buffer_dim = feature_dim * DIM;
-        incoming_grad_buffer = dL_grad_state_out;
-        coef = config.spiky_coef;
-    }
-    else if constexpr (COMP_TYPE == ComputationType::MomentMatrix)
-    {
-        incoming_grad_buffer_dim = DIM * DIM;
-        incoming_grad_buffer = dL_moment_matrix_out;
-        coef = config.spiky_coef;
-    }
-    else if constexpr (COMP_TYPE == ComputationType::DensityGradient)
-    {
-        incoming_grad_buffer_dim = DIM;
-        incoming_grad_buffer = dL_grad_density_out;
-        coef = config.spiky_coef;
-    }
-
-    constexpr int chunk_types = []()
-    {
-        if constexpr (BC == BoundaryCondition::PERIODIC)
-            return 2;
-        else
-            return 1;
-    }();
-    constexpr int NUM_NEIGHBOR_CELLS = (DIM == 2) ? 9 : 27;
-
-    // load particle position
-    ParticlePosition<DIM> p_i = read_position<DIM>(position_in, config.particle_count, batch_idx, particle_idx);
-
-    m_i = read_mass(mass_in, config.particle_count, batch_idx, particle_idx, default_mass);
-
-    // local particle density
-    if constexpr (COMP_TYPE == ComputationType::Blur || COMP_TYPE == ComputationType::Gradient || COMP_TYPE == ComputationType::MomentMatrix)
-        v_i = m_i / read_state(rho_in, config.particle_count, 1, batch_idx, particle_idx, 0);
-
-    float v_i_sq_over_m_i = 0.0f;
-    if constexpr (COMP_TYPE == ComputationType::Blur || COMP_TYPE == ComputationType::Gradient || COMP_TYPE == ComputationType::MomentMatrix)
-        v_i_sq_over_m_i = (v_i * v_i) / m_i;
-
-    // local particle state
-    if constexpr (COMP_TYPE == ComputationType::Gradient || COMP_TYPE == ComputationType::Blur)
-        if constexpr (!COMPUTE_DS_ONLY)
-            for (uint32_t f = 0; f < feature_dim; ++f)
-                s_i[f] = read_state(state_in, config.particle_count, feature_dim, batch_idx, particle_idx, f);
-
-    if constexpr (!COMPUTE_DS_ONLY || COMP_TYPE != ComputationType::Blur)
-        for (uint32_t k = 0; k < incoming_grad_buffer_dim; ++k)
-            grad_i[k] = read_state(incoming_grad_buffer, config.particle_count, incoming_grad_buffer_dim, batch_idx, particle_idx, k);
-
-    int local_cell[DIM];
-    int neighbor_cell[DIM];
-    config.pos2cell(p_i, local_cell);
-    uint32_t local_cell_idx = config.cell2hash(local_cell);
-
-    // TODO: Switch to Morton Hashing for better memory access patterns
-    // Change GridConfig accordingly
-    for (int k = 0; k < NUM_NEIGHBOR_CELLS; k++)
-    {
-        if constexpr (DIM == 2)
-        {
-            neighbor_cell[0] = local_cell[0] + (k % 3 - 1);
-            neighbor_cell[1] = local_cell[1] + (k / 3 - 1);
-        }
-        else if constexpr (DIM == 3)
-        {
-            neighbor_cell[0] = local_cell[0] + (k % 3 - 1);
-            neighbor_cell[1] = local_cell[1] + ((k / 3) % 3 - 1);
-            neighbor_cell[2] = local_cell[2] + (k / 9 - 1);
-        }
-
-        if (!config.is_in_bound(neighbor_cell))
-            continue;
-
-        config.apply_boundary(neighbor_cell);
-        uint32_t neighbor_cell_idx = config.cell2hash(neighbor_cell);
-
-        uint32_t remote_start = bin_offsets[batch_idx * config.cell_count + neighbor_cell_idx] - batch_idx * config.particle_count;
-        uint32_t remote_end = bin_offsets[batch_idx * config.cell_count + neighbor_cell_idx + 1] - batch_idx * config.particle_count;
-        uint32_t remote_count = remote_end - remote_start;
-        if (remote_count == 0)
-            continue;
-
-        for (uint32_t j = 0; j < remote_count; ++j)
-        {
-            ParticlePosition<DIM> p_j = read_position<DIM>(position_in, config.particle_count, batch_idx, remote_start + j);
-            if (config.l2_distance(p_i, p_j) >= eps2)
-                continue;
-
-            if constexpr (COMP_TYPE == ComputationType::Blur || COMP_TYPE == ComputationType::Gradient || COMP_TYPE == ComputationType::MomentMatrix)
-                if (!COMPUTE_DS_ONLY || COMP_TYPE != ComputationType::Blur)
-                {
-                    m_j = read_mass(mass_in, config.particle_count, batch_idx, remote_start + j, default_mass);
-                    v_j = m_j / read_state(rho_in, config.particle_count, 1, batch_idx, remote_start + j, 0);
-                }
-
-            if constexpr (COMP_TYPE == ComputationType::Blur || COMP_TYPE == ComputationType::Gradient)
-                if constexpr (!COMPUTE_DS_ONLY)
-                    for (uint32_t f = 0; f < feature_dim; ++f)
-                        s_j[f] = read_state(state_in, config.particle_count, feature_dim, batch_idx, remote_start + j, f);
-
-            for (uint32_t k = 0; k < incoming_grad_buffer_dim; ++k)
-                grad_j[k] = read_state(incoming_grad_buffer, config.particle_count, incoming_grad_buffer_dim, batch_idx, remote_start + j, k);
-
-            if constexpr (COMP_TYPE == ComputationType::Density)
-            {
-                m_j = read_mass(mass_in, config.particle_count, batch_idx, remote_start + j, default_mass);
-                float grad_coef = grad_i[0] * m_j + grad_j[0] * m_i;
-                ParticlePosition<DIM> r_ij = config.displacement(p_j, p_i);
-                backward_smoothing_kernel_inplace(r_ij, config.eps, grad_coef, &grad_x[0]);
-            }
-
-            if constexpr (COMP_TYPE == ComputationType::Blur)
-            {
-                ParticlePosition<DIM> r_ij = config.displacement(p_j, p_i);
-                float w_ij = smoothing_kernel(r_ij, config.eps);
-                for (uint32_t f = 0; f < feature_dim; ++f)
-                {
-                    grad_s[f] += w_ij * v_i * grad_j[f];
-                    if constexpr (!COMPUTE_DS_ONLY)
-                    {
-                        grad_rho += -grad_j[f] * w_ij * s_i[f] * v_i_sq_over_m_i;
-                        backward_smoothing_kernel_inplace(r_ij, config.eps,
-                                                          grad_i[f] * s_j[f] * v_j + grad_j[f] * s_i[f] * v_i, &grad_x[0]);
-                    }
-                }
-            }
-
-            if constexpr (COMP_TYPE == ComputationType::Gradient)
-            {
-                float w_ij[DIM] = {0.0f};
-                ParticlePosition<DIM> r_ij = config.displacement(p_j, p_i);
-                spiky_kernel_inplace(r_ij, config.eps, 1.0, w_ij);
-                for (uint32_t f = 0; f < feature_dim; ++f)
-                {
-                    float grad_diff[DIM] = {0.0f};
-                    for (uint32_t d = 0; d < DIM; ++d)
-                    {
-                        float c = grad_j[f * DIM + d] * v_i + grad_i[f * DIM + d] * v_j;
-                        grad_s[f] += c * w_ij[d];
-                        if constexpr (!COMPUTE_DS_ONLY)
-                        {
-                            grad_rho += -grad_j[f * DIM + d] * (s_i[f] - s_j[f]) * w_ij[d] * v_i_sq_over_m_i;
-                            grad_diff[d] = (s_i[f] - s_j[f]) * c;
-                        }
-                    }
-                    if constexpr (!COMPUTE_DS_ONLY)
-                        backward_spiky_kernel_inplace(r_ij, config.eps, grad_diff, &grad_x[0]);
-                }
-            }
-
-            if constexpr (COMP_TYPE == ComputationType::DensityGradient)
-            {
-                m_j = read_mass(mass_in, config.particle_count, batch_idx, remote_start + j, default_mass);
-                float grad_diff[DIM];
-                for (uint32_t d = 0; d < DIM; ++d)
-                    grad_diff[d] = grad_j[d] * m_i - grad_i[d] * m_j;
-
-                ParticlePosition<DIM> r_ij = config.displacement(p_j, p_i);
-                backward_spiky_kernel_inplace(r_ij, config.eps, grad_diff, &grad_x[0]);
-            }
-
-            if constexpr (COMP_TYPE == ComputationType::MomentMatrix)
-            {
-                ParticlePosition<DIM> r_ij = config.displacement(p_j, p_i);
-                float r[DIM];
-                for (uint32_t d = 0; d < DIM; ++d)
-                    r[d] = r_ij[d];
-
-                float w_ij[DIM] = {0.0f};
-                spiky_kernel_inplace(r_ij, config.eps, 1.0, w_ij);
-
-                float grad_diff[DIM * DIM];
-                for (uint32_t d1 = 0; d1 < DIM; ++d1)
-                    for (uint32_t d2 = 0; d2 < DIM; ++d2)
-                    {
-                        grad_rho += -grad_j[d1 * DIM + d2] * r[d1] * w_ij[d2] * v_i_sq_over_m_i;
-                        float c = grad_i[d1 * DIM + d2] * v_j + grad_j[d1 * DIM + d2] * v_i;
-                        grad_x[d1] += w_ij[d2] * c;
-                        grad_diff[d1 * DIM + d2] = r[d1] * c;
-                    }
-
-                for (uint32_t d = 0; d < DIM; ++d)
-                    backward_spiky_kernel_inplace(r_ij, config.eps, &grad_diff[d * DIM], &grad_x[0]);
-            }
-        }
-    }
-
-    if constexpr (!COMPUTE_DS_ONLY)
-    {
-
-        uint32_t idx = batch_idx * config.particle_count + particle_idx;
-        if constexpr (DIM == 2)
-            dL_position_in[idx].pos = make_float2(grad_x[0] * coef,
-                                                  grad_x[1] * coef);
-        else if constexpr (DIM == 3)
-            dL_position_in[idx].pos = make_float4(grad_x[0] * coef,
-                                                  grad_x[1] * coef,
-                                                  grad_x[2] * coef, 0.0f);
-    }
-
-    if constexpr (!COMPUTE_DS_ONLY)
-        if constexpr (COMP_TYPE == ComputationType::Blur || COMP_TYPE == ComputationType::Gradient || COMP_TYPE == ComputationType::MomentMatrix)
-            dL_rho_in[batch_idx * config.particle_count + particle_idx] = grad_rho * coef;
-
-    if constexpr (COMP_TYPE == ComputationType::Blur || COMP_TYPE == ComputationType::Gradient)
-        for (uint32_t f = 0; f < feature_dim; ++f)
-            dL_state_in[(batch_idx * config.particle_count + particle_idx) * feature_dim + f] = grad_s[f] * coef;
-}
-
 template <int DIM, ComputationType COMP_TYPE, int STRIDE = 128,
           BoundaryCondition BC = BoundaryCondition::PERIODIC,
-          KernelStrategy ST = KernelStrategy::GridBased,
           bool COMPUTE_DS_ONLY = false>
 __global__ void backward_kernel(
     const ParticlePosition<DIM> * __restrict__ position_in, // Shape (batch_size, N, DIM)
@@ -764,7 +322,7 @@ __global__ void backward_kernel(
     uint32_t feature_dim,                     // Number of features in state
     const uint32_t * __restrict__ bin_offsets, // Shape (batch_size * cell_count + 1)
     const BlockInfo * __restrict__ block_info, // Block information array
-    const GridConfig<DIM, BC, ST> config)
+    const GridConfig<DIM, BC> config)
 {
     // BlockInfo belongs to the saved snapshot. The grid's block offsets are
     // scratch storage and may already describe a later rollout step.
@@ -782,11 +340,7 @@ __global__ void backward_kernel(
     float *local_density_rcp, *neighbor_density_rcp;
     float *local_mass, *neighbor_mass;
     const float *incoming_grad_buffer;
-    int incoming_grad_buffer_dim;
-    uint32_t feature_dim_log2 = 0;
-    bool is_feature_dim_pow2;
-    uint32_t grad_dim_log2 = 0;
-    bool is_grad_dim_pow2;
+    uint32_t incoming_grad_buffer_dim;
     float default_mass = config.default_mass;
 
     if constexpr (COMP_TYPE == ComputationType::Count)
@@ -805,7 +359,6 @@ __global__ void backward_kernel(
         neighbor_mass = &local_mass[STRIDE];      // STRIDE
         incoming_grad_buffer = dL_rho_out;
         incoming_grad_buffer_dim = 1;
-        is_grad_dim_pow2 = true;
     }
     else if constexpr (COMP_TYPE == ComputationType::Blur)
     {
@@ -837,12 +390,6 @@ __global__ void backward_kernel(
         }
         incoming_grad_buffer = dL_blur_state_out;
         incoming_grad_buffer_dim = feature_dim;
-        is_feature_dim_pow2 = (feature_dim & (feature_dim - 1)) == 0;
-        while ((1U << feature_dim_log2) < feature_dim)
-            feature_dim_log2++;
-
-        is_grad_dim_pow2 = is_feature_dim_pow2;
-        grad_dim_log2 = feature_dim_log2;
     }
     else if constexpr (COMP_TYPE == ComputationType::Gradient)
     {
@@ -875,13 +422,6 @@ __global__ void backward_kernel(
         }
         incoming_grad_buffer = dL_grad_state_out;
         incoming_grad_buffer_dim = feature_dim * DIM;
-        is_feature_dim_pow2 = (feature_dim & (feature_dim - 1)) == 0;
-        while ((1U << feature_dim_log2) < feature_dim)
-            feature_dim_log2++;
-
-        is_grad_dim_pow2 = (incoming_grad_buffer_dim & (incoming_grad_buffer_dim - 1)) == 0;
-        while ((1U << grad_dim_log2) < incoming_grad_buffer_dim)
-            grad_dim_log2++;
     }
     else if constexpr (COMP_TYPE == ComputationType::MomentMatrix)
     {
@@ -899,9 +439,6 @@ __global__ void backward_kernel(
         local_state = neighbor_state = nullptr;
         incoming_grad_buffer = dL_moment_matrix_out;
         incoming_grad_buffer_dim = DIM * DIM;
-
-        is_grad_dim_pow2 = DIM == 2;
-        grad_dim_log2 = DIM == 2 ? 2 : 3;
     }
     else if constexpr (COMP_TYPE == ComputationType::DensityGradient)
     {
@@ -917,47 +454,30 @@ __global__ void backward_kernel(
         dL_drho_buffer = dL_ds_buffer = nullptr;
         incoming_grad_buffer = dL_grad_density_out;
         incoming_grad_buffer_dim = DIM;
-        is_grad_dim_pow2 = (DIM & (DIM - 1)) == 0;
-        grad_dim_log2 = DIM == 2 ? 1 : 2;
     }
     else
     {
         return; // Unsupported computation type
     }
 
-    int global_cell_idx = b_info.cell_idx;
-    int local_cell_idx = global_cell_idx % config.cell_count; // Extract local cell index from global
+    const RowSplit features(feature_dim);
+    const RowSplit grads(incoming_grad_buffer_dim);
 
     uint32_t batch_idx = b_info.batch_idx;
-    constexpr int NUM_ROWS = (DIM == 2) ? 3 : 9; // Number of rows of neighbor cells to consider
-
     int cell[DIM];
-    int neighbor_cell[DIM];
-    config.hash2cell(local_cell_idx, cell);
+    config.hash2cell(b_info.cell_idx % config.cell_count, cell);
 
-    uint32_t local_start = bin_offsets[global_cell_idx] - batch_idx * config.particle_count;
-    uint32_t local_end = bin_offsets[global_cell_idx + 1] - batch_idx * config.particle_count;
-    local_start += b_info.offset_in_cell;
+    // Batch-local indices of this grid block's particles.
+    uint32_t local_start = bin_offsets[b_info.cell_idx] - batch_idx * config.particle_count + b_info.offset_in_cell;
+    uint32_t local_end = bin_offsets[b_info.cell_idx + 1] - batch_idx * config.particle_count;
     local_end = min(local_end, local_start + b_info.particle_count);
     uint32_t local_count = local_end - local_start;
-    if (local_count <= 0)
-        return;
-
     float eps2 = config.eps * config.eps;
-
-    // Outermost loop: chunk types.
-    constexpr int chunk_types = []()
-    {
-        if constexpr (BC == BoundaryCondition::PERIODIC)
-            return 2;
-        else
-            return 1;
-    }();
 
     ParticlePosition<DIM> *dL_dx_global;
     float *dL_drho_global, *dL_ds_global;
 
-    // First loop: local chunks
+    // Local particles in chunks of STRIDE; each chunk visits all neighbor tiles.
     for (uint32_t local_offset = 0; local_offset < local_count; local_offset += STRIDE)
     {
         uint32_t local_chunk = min(STRIDE, local_count - local_offset);
@@ -972,14 +492,8 @@ __global__ void backward_kernel(
         {
             for (uint32_t k = threadIdx.x; k < local_chunk * incoming_grad_buffer_dim; k += blockDim.x)
             {
-                uint32_t particle_idx = is_grad_dim_pow2 ? k >> grad_dim_log2 : k / incoming_grad_buffer_dim;
-                uint32_t grad_idx = is_grad_dim_pow2 ? k & (incoming_grad_buffer_dim - 1) : k % incoming_grad_buffer_dim;
-                dL_local[k] = read_state(incoming_grad_buffer,
-                                         config.particle_count,
-                                         incoming_grad_buffer_dim,
-                                         batch_idx,
-                                         local_start + local_offset + particle_idx,
-                                         grad_idx);
+                dL_local[k] = read_state(incoming_grad_buffer, config.particle_count, incoming_grad_buffer_dim,
+                                         batch_idx, local_start + local_offset + grads.row(k), grads.col(k));
             }
         }
         // Each thread loads local state if needed
@@ -989,13 +503,8 @@ __global__ void backward_kernel(
             {
                 for (uint32_t k = threadIdx.x; k < local_chunk * feature_dim; k += blockDim.x)
                 {
-                    uint32_t particle_idx = is_feature_dim_pow2 ? k >> feature_dim_log2 : k / feature_dim;
-                    uint32_t feature_idx = is_feature_dim_pow2 ? k & (feature_dim - 1) : k % feature_dim;
-                    local_state[k] = read_state(state_in,
-                                                config.particle_count,
-                                                feature_dim,
-                                                batch_idx, local_start + local_offset + particle_idx,
-                                                feature_idx);
+                    local_state[k] = read_state(state_in, config.particle_count, feature_dim,
+                                                batch_idx, local_start + local_offset + features.row(k), features.col(k));
                 }
             }
         }
@@ -1060,63 +569,25 @@ __global__ void backward_kernel(
                 dL_ds_buffer[k] = 0.0f;
         }
 
-        for (int row_idx = 0; row_idx < NUM_ROWS; row_idx++)
+        // Same spans as GridConfig::neighbor_span, computed inline: in these
+        // block-wide kernels the inline form compiles to faster code.
+        for (int row = 0; row < GridConfig<DIM, BC>::NEIGHBOR_ROWS; ++row)
         {
-            if constexpr (DIM == 2)
+            int neighbor[DIM];
+            if (!config.neighbor_row(cell, row, neighbor))
+                continue;
+            for (int wrap = 0; wrap < GridConfig<DIM, BC>::WRAP_CHUNKS; ++wrap)
             {
-                neighbor_cell[0] = cell[0];
-                neighbor_cell[1] = cell[1] + (row_idx - 1);
-
-                if (!config.is_in_bound(neighbor_cell))
+                int first_x, last_x;
+                if (!config.row_x_range(cell, wrap, first_x, last_x))
                     continue;
-
-                config.apply_boundary(neighbor_cell);
-            }
-            else if constexpr (DIM == 3)
-            {
-                neighbor_cell[0] = cell[0];
-                neighbor_cell[1] = cell[1] + (row_idx / 3 - 1);
-                neighbor_cell[2] = cell[2] + (row_idx % 3 - 1);
-                if (!config.is_in_bound(neighbor_cell))
-                    continue;
-                config.apply_boundary(neighbor_cell);
-            }
-            for (int chunk_type = 0; chunk_type < chunk_types; chunk_type++)
-            {
-                // Handle wrap-around for x dimension if config.boundary_condition == PERIODIC
-                int remote_x_start, remote_x_end;
-                if (chunk_type == 1)
-                {
-                    if (cell[0] > 0 && cell[0] < config.grid_size[0] - 1)
-                        continue;
-                    else
-                    {
-                        if (cell[0] == 0)
-                        {
-                            remote_x_start = config.grid_size[0] - 1;
-                            remote_x_end = config.grid_size[0] - 1;
-                        }
-                        else if (cell[0] == config.grid_size[0] - 1)
-                        {
-                            remote_x_start = 0;
-                            remote_x_end = 0;
-                        }
-                    }
-                }
-                else
-                {
-                    remote_x_start = max(0, cell[0] - 1);
-                    remote_x_end = min(config.grid_size[0] - 1, cell[0] + 1);
-                }
-
-                neighbor_cell[0] = remote_x_start;
-                uint32_t remote_cell_start_idx = config.cell2hash(neighbor_cell);
-                neighbor_cell[0] = remote_x_end;
-                uint32_t remote_cell_end_idx = config.cell2hash(neighbor_cell);
-
-                uint32_t remote_start = bin_offsets[batch_idx * config.cell_count + remote_cell_start_idx] - batch_idx * config.particle_count;
-                uint32_t remote_end = bin_offsets[batch_idx * config.cell_count + remote_cell_end_idx + 1] - batch_idx * config.particle_count;
-
+                neighbor[0] = first_x;
+                uint32_t first = config.cell2hash(neighbor);
+                neighbor[0] = last_x;
+                uint32_t last = config.cell2hash(neighbor);
+                // Batch-local indices, as read_position and read_state expect.
+                uint32_t remote_start = bin_offsets[batch_idx * config.cell_count + first] - batch_idx * config.particle_count;
+                uint32_t remote_end = bin_offsets[batch_idx * config.cell_count + last + 1] - batch_idx * config.particle_count;
                 uint32_t remote_count = remote_end - remote_start;
                 if (remote_count == 0)
                     continue;
@@ -1137,13 +608,8 @@ __global__ void backward_kernel(
                         {
                             for (uint32_t k = threadIdx.x; k < remote_chunk * feature_dim; k += blockDim.x)
                             {
-                                uint32_t particle_idx = is_feature_dim_pow2 ? k >> feature_dim_log2 : k / feature_dim;
-                                uint32_t feature_idx = is_feature_dim_pow2 ? k & (feature_dim - 1) : k % feature_dim;
-                                neighbor_state[k] = read_state(state_in,
-                                                               config.particle_count,
-                                                               feature_dim,
-                                                               batch_idx, remote_start + remote_offset + particle_idx,
-                                                               feature_idx);
+                                neighbor_state[k] = read_state(state_in, config.particle_count, feature_dim, batch_idx,
+                                                               remote_start + remote_offset + features.row(k), features.col(k));
                             }
                         }
                     }
@@ -1170,13 +636,8 @@ __global__ void backward_kernel(
                     // Each thread loads the backprop gradients for neighbor particles
                     for (uint32_t k = threadIdx.x; k < remote_chunk * incoming_grad_buffer_dim; k += blockDim.x)
                     {
-                        uint32_t particle_idx = is_grad_dim_pow2 ? k >> grad_dim_log2 : k / incoming_grad_buffer_dim;
-                        uint32_t grad_idx = is_grad_dim_pow2 ? k & (incoming_grad_buffer_dim - 1) : k % incoming_grad_buffer_dim;
-                        dL_neighbor[k] = read_state(incoming_grad_buffer,
-                                                    config.particle_count,
-                                                    incoming_grad_buffer_dim,
-                                                    batch_idx, remote_start + remote_offset + particle_idx,
-                                                    grad_idx);
+                        dL_neighbor[k] = read_state(incoming_grad_buffer, config.particle_count, incoming_grad_buffer_dim,
+                                                    batch_idx, remote_start + remote_offset + grads.row(k), grads.col(k));
                     }
 
                     __syncthreads();
@@ -1210,10 +671,8 @@ __global__ void backward_kernel(
                     {
                         for (uint32_t i = threadIdx.x; i < local_chunk * feature_dim; i += blockDim.x)
                         {
-                            // uint32_t particle_idx = i / feature_dim;
-                            // uint32_t feature_idx = i % feature_dim;
-                            uint32_t particle_idx = is_feature_dim_pow2 ? i >> feature_dim_log2 : i / feature_dim;
-                            uint32_t feature_idx = is_feature_dim_pow2 ? i & (feature_dim - 1) : i % feature_dim;
+                            uint32_t particle_idx = features.row(i);
+                            uint32_t feature_idx = features.col(i);
                             ParticlePosition<DIM> p_i = local_pos[particle_idx];
                             float grad_i, s_i, v_i;
                             float grad_j, s_j, v_j;
@@ -1290,10 +749,8 @@ __global__ void backward_kernel(
                     {
                         for (uint32_t i = threadIdx.x; i < local_chunk * feature_dim; i += blockDim.x)
                         {
-                            // uint32_t particle_idx = i / feature_dim;
-                            // uint32_t feature_idx = i % feature_dim;
-                            uint32_t particle_idx = is_feature_dim_pow2 ? i >> feature_dim_log2 : i / feature_dim;
-                            uint32_t feature_idx = is_feature_dim_pow2 ? i & (feature_dim - 1) : i % feature_dim;
+                            uint32_t particle_idx = features.row(i);
+                            uint32_t feature_idx = features.col(i);
                             ParticlePosition<DIM> p_i = local_pos[particle_idx];
                             float grad_i[DIM], s_i, v_i;
                             float grad_j[DIM], s_j, v_j;
@@ -1415,9 +872,9 @@ __global__ void backward_kernel(
                 }
                 else if constexpr (DIM == 3)
                 {
-                    dL_dx_global[k].pos = make_float4(dL_dx_buffer[k * DIM + 0],
+                    dL_dx_global[k].pos = make_float3(dL_dx_buffer[k * DIM + 0],
                                                       dL_dx_buffer[k * DIM + 1],
-                                                      dL_dx_buffer[k * DIM + 2], 0.0f);
+                                                      dL_dx_buffer[k * DIM + 2]);
                 }
             }
         }
@@ -1442,7 +899,7 @@ __global__ void backward_kernel(
     }
 }
 
-template <int DIM, ComputationType COMP_TYPE, int STRIDE = 128, BoundaryCondition BC = BoundaryCondition::PERIODIC, KernelStrategy ST = KernelStrategy::GridBased>
+template <int DIM, ComputationType COMP_TYPE, int STRIDE = 128, BoundaryCondition BC = BoundaryCondition::PERIODIC>
 __global__ void forward_kernel(
     const ParticlePosition<DIM> * __restrict__ position_in, // Shape (batch_size, N, DIM)
     const float * __restrict__ rho_in,                      // Input density tensor, Shape (batch_size, N)
@@ -1457,23 +914,19 @@ __global__ void forward_kernel(
     uint32_t feature_dim,                     // Number of features in state
     const uint32_t * __restrict__ bin_offsets, // Shape (batch_size * cell_count + 1)
     const BlockInfo * __restrict__ block_info, // Block information array
-    const GridConfig<DIM, BC, ST> config)
+    const GridConfig<DIM, BC> config)
 {
-
     BlockInfo b_info = block_info[blockIdx.x];
     if (b_info.particle_count == 0)
         return;
 
-    constexpr int NUM_ROWS = (DIM == 2) ? 3 : 9;
-    uint32_t output_dim = 1;
     __shared__ ParticlePosition<DIM> local_pos[STRIDE];
     __shared__ ParticlePosition<DIM> neighbor_pos[STRIDE];
     extern __shared__ float smem[];
-    float *local_buffer, *neighbor_state, *local_state, *neighbor_density_rcp, *neighbor_mass, *output_buffer;
-    local_buffer = smem;
-    uint32_t feature_dim_log2 = 0;
-    float default_mass = config.default_mass;
-    bool is_pow2;
+    float *local_buffer = smem;
+    float *neighbor_state, *local_state, *neighbor_density_rcp, *neighbor_mass, *output_buffer;
+    uint32_t output_dim = 1;
+    const RowSplit features(feature_dim);
     if constexpr (COMP_TYPE == ComputationType::Blur)
     {
         neighbor_state = &local_buffer[feature_dim * STRIDE];
@@ -1481,9 +934,6 @@ __global__ void forward_kernel(
         neighbor_mass = &neighbor_density_rcp[STRIDE];
         output_buffer = blur_state_out;
         output_dim = feature_dim;
-        is_pow2 = (feature_dim & (feature_dim - 1)) == 0;
-        while ((1U << feature_dim_log2) < feature_dim)
-            feature_dim_log2++;
     }
     else if constexpr (COMP_TYPE == ComputationType::Gradient)
     {
@@ -1493,9 +943,6 @@ __global__ void forward_kernel(
         neighbor_mass = &neighbor_density_rcp[STRIDE];
         output_buffer = grad_state_out;
         output_dim = feature_dim * DIM;
-        is_pow2 = (feature_dim & (feature_dim - 1)) == 0;
-        while ((1U << feature_dim_log2) < feature_dim)
-            feature_dim_log2++;
     }
     else if constexpr (COMP_TYPE == ComputationType::MomentMatrix)
     {
@@ -1515,132 +962,62 @@ __global__ void forward_kernel(
         neighbor_mass = &local_buffer[STRIDE];
         output_buffer = rho_out;
     }
-    else if constexpr (COMP_TYPE == ComputationType::Count)
+    else
     {
         output_buffer = count_out;
         neighbor_mass = nullptr;
     }
-    else
-        output_buffer = nullptr;
 
-    // BlockInfo b_info = block_info[batch_idx * config.max_blocks_per_batch + blockIdx.x];
     uint32_t batch_idx = b_info.batch_idx;
-
-    if (b_info.particle_count == 0)
-        return;
-
-    if (batch_idx >= config.batch_size)
-        return;
-
-    int global_cell_idx = b_info.cell_idx;
-    int local_cell_idx = global_cell_idx % config.cell_count; // Extract local cell index from global
-
     int cell[DIM];
-    int neighbor_cell[DIM];
-    config.hash2cell(local_cell_idx, cell);
+    config.hash2cell(b_info.cell_idx % config.cell_count, cell);
 
-    uint32_t local_start = bin_offsets[global_cell_idx] - batch_idx * config.particle_count;
-    uint32_t local_end = bin_offsets[global_cell_idx + 1] - batch_idx * config.particle_count;
-    local_start += b_info.offset_in_cell;
+    // Batch-local indices of this grid block's particles.
+    uint32_t local_start = bin_offsets[b_info.cell_idx] - batch_idx * config.particle_count + b_info.offset_in_cell;
+    uint32_t local_end = bin_offsets[b_info.cell_idx + 1] - batch_idx * config.particle_count;
     local_end = min(local_end, local_start + b_info.particle_count);
     uint32_t local_count = local_end - local_start;
-    if (local_count <= 0)
-        return;
-
     float eps2 = config.eps * config.eps;
+    float default_mass = config.default_mass;
 
-    // Outermost loop: chunk types.
-    constexpr int chunk_types = []()
-    {
-        if constexpr (BC == BoundaryCondition::PERIODIC)
-            return 2;
-        else
-            return 1;
-    }();
-
-    // First loop: local chunks
+    // Local particles in chunks of STRIDE; each chunk visits all neighbor tiles.
     for (uint32_t local_offset = 0; local_offset < local_count; local_offset += STRIDE)
     {
         uint32_t local_chunk = min(STRIDE, local_count - local_offset);
 
-        // Each thread loads a few particles into shared memory
         for (uint32_t k = threadIdx.x; k < local_chunk; k += blockDim.x)
             local_pos[k] = read_position<DIM>(position_in, config.particle_count, batch_idx,
                                               local_start + local_offset + k);
-
-        // Each thread loads local state if needed
         if constexpr (COMP_TYPE == ComputationType::Gradient)
         {
             for (uint32_t k = threadIdx.x; k < local_chunk * feature_dim; k += blockDim.x)
-            {
-                int particle_idx = is_pow2 ? k >> feature_dim_log2 : k / feature_dim;
-                int feature_idx = is_pow2 ? k & (feature_dim - 1) : k % feature_dim;
-                local_state[k] = read_state(state_in, config.particle_count, feature_dim, batch_idx, local_start + local_offset + particle_idx, feature_idx);
-            }
+                local_state[k] = read_state(state_in, config.particle_count, feature_dim, batch_idx,
+                                            local_start + local_offset + features.row(k), features.col(k));
         }
 
         float *output_buffer_global = output_buffer + (batch_idx * config.particle_count + local_start + local_offset) * output_dim;
-
         for (uint32_t k = threadIdx.x; k < local_chunk * output_dim; k += blockDim.x)
             local_buffer[k] = 0.0f;
 
-        for (int row_idx = 0; row_idx < NUM_ROWS; row_idx++)
+        // Same spans as GridConfig::neighbor_span, computed inline: in these
+        // block-wide kernels the inline form compiles to faster code.
+        for (int row = 0; row < GridConfig<DIM, BC>::NEIGHBOR_ROWS; ++row)
         {
-            if constexpr (DIM == 2)
+            int neighbor[DIM];
+            if (!config.neighbor_row(cell, row, neighbor))
+                continue;
+            for (int wrap = 0; wrap < GridConfig<DIM, BC>::WRAP_CHUNKS; ++wrap)
             {
-                neighbor_cell[0] = cell[0];
-                neighbor_cell[1] = cell[1] + (row_idx - 1);
-
-                if (!config.is_in_bound(neighbor_cell))
+                int first_x, last_x;
+                if (!config.row_x_range(cell, wrap, first_x, last_x))
                     continue;
-
-                config.apply_boundary(neighbor_cell);
-            }
-            else if constexpr (DIM == 3)
-            {
-                neighbor_cell[0] = cell[0];
-                neighbor_cell[1] = cell[1] + (row_idx / 3 - 1);
-                neighbor_cell[2] = cell[2] + (row_idx % 3 - 1);
-                if (!config.is_in_bound(neighbor_cell))
-                    continue;
-                config.apply_boundary(neighbor_cell);
-            }
-            for (int chunk_type = 0; chunk_type < chunk_types; chunk_type++)
-            {
-                // Handle wrap-around for x dimension if config.boundary_condition == PERIODIC
-                int remote_x_start, remote_x_end;
-                if (chunk_type == 1)
-                {
-                    if (cell[0] > 0 && cell[0] < config.grid_size[0] - 1)
-                        continue;
-                    else
-                    {
-                        if (cell[0] == 0)
-                        {
-                            remote_x_start = config.grid_size[0] - 1;
-                            remote_x_end = config.grid_size[0] - 1;
-                        }
-                        else if (cell[0] == config.grid_size[0] - 1)
-                        {
-                            remote_x_start = 0;
-                            remote_x_end = 0;
-                        }
-                    }
-                }
-                else
-                {
-                    remote_x_start = max(0, cell[0] - 1);
-                    remote_x_end = min(config.grid_size[0] - 1, cell[0] + 1);
-                }
-
-                neighbor_cell[0] = remote_x_start;
-                uint32_t remote_cell_start_idx = config.cell2hash(neighbor_cell);
-                neighbor_cell[0] = remote_x_end;
-                uint32_t remote_cell_end_idx = config.cell2hash(neighbor_cell);
-
-                uint32_t remote_start = bin_offsets[batch_idx * config.cell_count + remote_cell_start_idx] - batch_idx * config.particle_count;
-                uint32_t remote_end = bin_offsets[batch_idx * config.cell_count + remote_cell_end_idx + 1] - batch_idx * config.particle_count;
-
+                neighbor[0] = first_x;
+                uint32_t first = config.cell2hash(neighbor);
+                neighbor[0] = last_x;
+                uint32_t last = config.cell2hash(neighbor);
+                // Batch-local indices, as read_position and read_state expect.
+                uint32_t remote_start = bin_offsets[batch_idx * config.cell_count + first] - batch_idx * config.particle_count;
+                uint32_t remote_end = bin_offsets[batch_idx * config.cell_count + last + 1] - batch_idx * config.particle_count;
                 uint32_t remote_count = remote_end - remote_start;
                 if (remote_count == 0)
                     continue;
@@ -1648,13 +1025,11 @@ __global__ void forward_kernel(
                 for (uint32_t remote_offset = 0; remote_offset < remote_count; remote_offset += STRIDE)
                 {
                     uint32_t remote_chunk = min(STRIDE, remote_count - remote_offset);
-                    // Each thread loads remote particle positions into shared memory
+                    // Stage this tile of neighbors (positions, then what the operator needs).
                     for (uint32_t k = threadIdx.x; k < remote_chunk; k += blockDim.x)
                         neighbor_pos[k] = read_position<DIM>(position_in,
                                                              config.particle_count, batch_idx,
                                                              remote_start + remote_offset + k);
-
-                    // Each thread loads remote particle mass/density if needed
                     if constexpr (COMP_TYPE == ComputationType::Blur || COMP_TYPE == ComputationType::Gradient || COMP_TYPE == ComputationType::MomentMatrix)
                     {
                         for (uint32_t k = threadIdx.x; k < remote_chunk; k += blockDim.x)
@@ -1673,32 +1048,25 @@ __global__ void forward_kernel(
                             neighbor_mass[k] = read_mass(mass_in, config.particle_count, batch_idx, idx, default_mass);
                         }
                     }
-
-                    // Better implementation (coalesced access)
                     if constexpr (COMP_TYPE == ComputationType::Blur || COMP_TYPE == ComputationType::Gradient)
                     {
                         for (uint32_t k = threadIdx.x; k < remote_chunk * feature_dim; k += blockDim.x)
-                        {
-                            int particle_idx = is_pow2 ? k >> feature_dim_log2 : k / feature_dim;
-                            int feature_idx = is_pow2 ? k & (feature_dim - 1) : k % feature_dim;
-                            neighbor_state[k] = read_state(state_in, config.particle_count, feature_dim, batch_idx, remote_start + remote_offset + particle_idx, feature_idx);
-                        }
+                            neighbor_state[k] = read_state(state_in, config.particle_count, feature_dim, batch_idx,
+                                                           remote_start + remote_offset + features.row(k), features.col(k));
                     }
                     __syncthreads();
 
-                    // Nested for loops to compute local/remote particles interactions
+                    // Local/neighbor interactions: one thread per local particle,
+                    // or per (particle, feature) for blur and gradient.
                     if constexpr (COMP_TYPE == ComputationType::Count || COMP_TYPE == ComputationType::Density)
                     {
                         for (uint32_t i = threadIdx.x; i < local_chunk; i += blockDim.x)
                         {
                             ParticlePosition<DIM> p_i = local_pos[i];
                             float output = 0.0f;
-
                             for (uint32_t j = 0; j < remote_chunk; ++j)
                             {
-                                // TODO: Think of offset + mod for improved shared memory access pattern (less bank conflicts)
                                 ParticlePosition<DIM> p_j = neighbor_pos[j];
-
                                 if (config.l2_distance(p_i, p_j) < eps2)
                                 {
                                     if constexpr (COMP_TYPE == ComputationType::Density)
@@ -1706,32 +1074,27 @@ __global__ void forward_kernel(
                                         ParticlePosition<DIM> r_ij = config.displacement(p_i, p_j);
                                         output += smoothing_kernel(r_ij, config.eps) * neighbor_mass[j];
                                     }
-
                                     if constexpr (COMP_TYPE == ComputationType::Count)
                                         output += 1.0f;
                                 }
                             }
                             if constexpr (COMP_TYPE == ComputationType::Density)
                                 local_buffer[i] += output * config.smoothing_coef;
-                            // atomicAdd(&output_buffer_global[i], output * config.smoothing_coef);
-
                             if constexpr (COMP_TYPE == ComputationType::Count)
                                 local_buffer[i] += output;
-                            // atomicAdd(&output_buffer_global[i], output);
                         }
                     }
                     if constexpr (COMP_TYPE == ComputationType::Blur)
                     {
                         for (uint32_t i = threadIdx.x; i < local_chunk * output_dim; i += blockDim.x)
                         {
-                            uint32_t particle_idx = is_pow2 ? i >> feature_dim_log2 : i / feature_dim;
-                            uint32_t feature_idx = is_pow2 ? i & (feature_dim - 1) : i % feature_dim;
+                            uint32_t particle_idx = features.row(i);
+                            uint32_t feature_idx = features.col(i);
                             ParticlePosition<DIM> p_i = local_pos[particle_idx];
                             float output = 0.0f;
                             for (uint32_t j = 0; j < remote_chunk; ++j)
                             {
                                 ParticlePosition<DIM> p_j = neighbor_pos[j];
-
                                 if (config.l2_distance(p_i, p_j) < eps2)
                                 {
                                     float v_j = neighbor_density_rcp[j];
@@ -1742,77 +1105,60 @@ __global__ void forward_kernel(
                                 }
                             }
                             local_buffer[i] += output * config.smoothing_coef;
-                            // atomicAdd(&output_buffer_global[i], output * config.smoothing_coef);
                         }
                     }
                     if constexpr (COMP_TYPE == ComputationType::Gradient)
                     {
                         for (uint32_t i = threadIdx.x; i < local_chunk * feature_dim; i += blockDim.x)
-                        // for (uint32_t i = threadIdx.x; i < local_chunk * output_dim; i += blockDim.x)
                         {
-                            uint32_t particle_idx = is_pow2 ? i >> feature_dim_log2 : i / feature_dim;
-                            uint32_t feature_idx = is_pow2 ? i & (feature_dim - 1) : i % feature_dim;
+                            uint32_t particle_idx = features.row(i);
+                            uint32_t feature_idx = features.col(i);
                             float s_i = local_state[i];
                             ParticlePosition<DIM> p_i = local_pos[particle_idx];
                             float output[DIM] = {0.0f};
-
                             for (uint32_t j = 0; j < remote_chunk; ++j)
                             {
                                 ParticlePosition<DIM> p_j = neighbor_pos[j];
-
                                 if (config.l2_distance(p_i, p_j) < eps2)
                                 {
                                     float v_j = neighbor_density_rcp[j];
                                     float s_j = neighbor_state[j * feature_dim + feature_idx];
-                                    // float gradw_ij = gradient_kernel(p_j - p_i, config.eps, dim_idx);
-                                    // output += (s_j - s_i) * gradw_ij / rho_j;
                                     ParticlePosition<DIM> r_ij = config.displacement(p_i, p_j);
                                     spiky_kernel_inplace(r_ij, config.eps, (s_j - s_i) * v_j, output);
                                 }
                             }
-                            // local_buffer[i] += output * config.spiky_coef;
                             for (uint32_t dim = 0; dim < DIM; ++dim)
                                 local_buffer[i * DIM + dim] += output[dim] * config.spiky_coef;
-                            // atomicAdd(&output_buffer_global[i * DIM + dim], output[dim] * config.spiky_coef);
                         }
                     }
                     if constexpr (COMP_TYPE == ComputationType::DensityGradient)
                     {
                         for (uint32_t i = threadIdx.x; i < local_chunk; i += blockDim.x)
                         {
-                            uint32_t particle_idx = i; // local particle index in chunk to process
-                            ParticlePosition<DIM> p_i = local_pos[particle_idx];
+                            ParticlePosition<DIM> p_i = local_pos[i];
                             float output[DIM] = {0.0f};
-
                             for (uint32_t j = 0; j < remote_chunk; ++j)
                             {
                                 ParticlePosition<DIM> p_j = neighbor_pos[j];
-
                                 if (config.l2_distance(p_i, p_j) < eps2)
                                 {
-                                    // output += gradient_kernel(p_j - p_i, config.eps, dim_idx);
                                     ParticlePosition<DIM> r_ij = config.displacement(p_i, p_j);
                                     spiky_kernel_inplace(r_ij, config.eps, neighbor_mass[j], output);
                                 }
                             }
-                            // local_buffer[i] += output * config.spiky_coef;
                             for (uint32_t dim = 0; dim < DIM; ++dim)
                                 local_buffer[i * DIM + dim] += output[dim] * config.spiky_coef;
-                            // atomicAdd(&output_buffer_global[i], output * config.smoothing_coef);
                         }
                     }
                     if constexpr (COMP_TYPE == ComputationType::MomentMatrix)
                     {
                         for (uint32_t i = threadIdx.x; i < local_chunk; i += blockDim.x)
                         {
-                            uint32_t particle_idx = i; // local particle index in chunk to process
-                            ParticlePosition<DIM> p_i = local_pos[particle_idx];
+                            ParticlePosition<DIM> p_i = local_pos[i];
                             float output[DIM * DIM] = {0.0f};
-
                             for (uint32_t j = 0; j < remote_chunk; ++j)
                             {
                                 ParticlePosition<DIM> p_j = neighbor_pos[j];
-
                                 if (config.l2_distance(p_i, p_j) < eps2)
                                 {
                                     float v_j = neighbor_density_rcp[j];
@@ -1822,7 +1168,6 @@ __global__ void forward_kernel(
                             }
                             for (uint32_t m = 0; m < DIM * DIM; ++m)
                                 local_buffer[i * DIM * DIM + m] += output[m] * config.spiky_coef;
-                            // atomicAdd(&output_buffer_global[i * DIM * DIM + m], output[m]);
                         }
                     }
                     __syncthreads();
@@ -1831,22 +1176,20 @@ __global__ void forward_kernel(
         }
 
         for (uint32_t k = threadIdx.x; k < local_chunk * output_dim; k += blockDim.x)
-        {
             output_buffer_global[k] = local_buffer[k];
-        }
     }
 }
 
-template <int DIM, BoundaryCondition BC, KernelStrategy ST>
+template <int DIM, BoundaryCondition BC>
 class HashGrid
 {
     static_assert(DIM == 2 || DIM == 3, "HashGrid only supports 2D or 3D");
 
 protected:
-    GridConfig<DIM, BC, ST> m_config;
+    GridConfig<DIM, BC> m_config;
 
     // One counter allocation, cleared by a single memset: cell counts (with a
-    // zero scan sentinel), then blocks per cell in grid mode.
+    // zero scan sentinel), then blocks per cell.
     uint32_t *m_cell_counts = nullptr;       // Device array of size (cell_count * batch_size + 1)
     size_t m_counter_words = 0;
 
@@ -1854,15 +1197,15 @@ protected:
     void *m_temp_storage = nullptr;
     size_t m_temp_storage_bytes = 0;
 
-    // BlockInfo *m_block_info = nullptr;     // Device array storing block information
     uint32_t *m_blocks_per_cell = nullptr; // Part of m_cell_counts: blocks needed per cell (batch_size * cell_count + 1)
     uint32_t *m_block_offsets = nullptr;   // Device array for cumulative sum of blocks per cell (batch_size * cell_count + 1)
-    float *m_unit_mass = nullptr;          // Grid mode: batch_size * N ones for fused perception without masses
+    float *m_unit_mass = nullptr;          // batch_size * N ones for fused perception without masses
 
-    uint32_t m_dimension;  // 2 for 2D, 4 for 3D (to align with float4)
+    uint32_t m_dimension;  // Floats per position: DIM
     uint32_t m_max_blocks; // Number of blocks used in the last computation
 
-    void _init(float eps, uint32_t particle_count, uint32_t batch_size, uint32_t max_particles_per_block)
+    void _init(const int (&grid_size)[DIM], float eps, uint32_t particle_count, uint32_t batch_size,
+               uint32_t max_particles_per_block)
     {
         m_config.eps = eps;
         m_config.inv_eps = 1.0f / eps;
@@ -1870,23 +1213,20 @@ protected:
         m_config.batch_size = batch_size;
         m_config.MAX_PARTICLES_PER_BLOCK = max_particles_per_block;
         m_config.default_mass = 1.0f;
-        for (uint32_t d = 0; d < DIM; ++d)
+        m_config.cell_count = 1;
+        m_config.is_pow2 = true;
+        for (int d = 0; d < DIM; ++d)
         {
-            m_config.L[d] = static_cast<float>(m_config.grid_size[d]) * m_config.eps;
+            m_config.grid_size[d] = grid_size[d];
+            m_config.cell_count *= uint32_t(grid_size[d]);
+            m_config.is_pow2 = m_config.is_pow2 && (grid_size[d] & (grid_size[d] - 1)) == 0;
+            m_config.L[d] = static_cast<float>(grid_size[d]) * eps;
             m_config.half_L[d] = 0.5f * m_config.L[d];
+            m_config.inv_L[d] = 1.0f / m_config.L[d];
         }
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            m_config.max_blocks_per_batch = min(particle_count,
-                                                m_config.cell_count + (particle_count + m_config.MAX_PARTICLES_PER_BLOCK - 1) / m_config.MAX_PARTICLES_PER_BLOCK);
-            m_max_blocks = m_config.max_blocks_per_batch * batch_size;
-        }
-
-        else
-        {
-            m_config.max_blocks_per_batch = 0; // dummy, not used
-            m_max_blocks = 1;                  // dummy, not used. Set to 1 to avoid zero-sized allocations.
-        }
+        m_config.max_blocks_per_batch = min(particle_count,
+                                            m_config.cell_count + (particle_count + m_config.MAX_PARTICLES_PER_BLOCK - 1) / m_config.MAX_PARTICLES_PER_BLOCK);
+        m_max_blocks = m_config.max_blocks_per_batch * batch_size;
 
         float inv_eps2 = m_config.inv_eps * m_config.inv_eps;
         float inv_eps4 = inv_eps2 * inv_eps2;
@@ -1909,28 +1249,27 @@ protected:
         // Allocate cell counts array
         // Exclusive scans include a zero sentinel to produce the final total.
         size_t scan_words = m_config.cell_count * size_t(batch_size) + 1;
-        m_counter_words = ST == KernelStrategy::GridBased ? 2 * scan_words : scan_words;
+        m_counter_words = 2 * scan_words;
         cuda_check(cudaMalloc(&m_cell_counts, sizeof(uint32_t) * m_counter_words));
 
-        // Determine temporary storage requirements for CUB prefix sum
-        cub::DeviceScan::ExclusiveSum(
+        m_blocks_per_cell = m_cell_counts + scan_words;
+
+        // Temporary storage of the zipped prefix sum over (cell count, blocks per cell).
+        cub::DeviceScan::ExclusiveScan(
             m_temp_storage, m_temp_storage_bytes,
-            m_cell_counts, (uint32_t *)nullptr, batch_size * m_config.cell_count + 1);
+            thrust::make_zip_iterator(thrust::make_tuple(m_cell_counts, m_blocks_per_cell)),
+            thrust::make_zip_iterator(thrust::make_tuple((uint32_t *)nullptr, (uint32_t *)nullptr)),
+            CounterPairSum{}, thrust::make_tuple(0u, 0u), scan_words);
 
         cuda_check(cudaMalloc(&m_temp_storage, m_temp_storage_bytes));
+        cuda_check(cudaMalloc(&m_block_offsets, sizeof(uint32_t) * scan_words));
+        // Omitted masses are ones; a persistent buffer avoids filling and
+        // binning one every step (binned ones are ones).
+        std::vector<float> ones(size_t(particle_count) * batch_size, 1.0f);
+        cuda_check(cudaMalloc(&m_unit_mass, sizeof(float) * ones.size()));
+        cuda_check(cudaMemcpy(m_unit_mass, ones.data(), sizeof(float) * ones.size(), cudaMemcpyHostToDevice));
 
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            m_blocks_per_cell = m_cell_counts + scan_words;
-            cuda_check(cudaMalloc(&m_block_offsets, sizeof(uint32_t) * scan_words));
-            // Omitted masses are ones; a persistent buffer avoids filling and
-            // binning one every step (binned ones are ones).
-            std::vector<float> ones(size_t(particle_count) * batch_size, 1.0f);
-            cuda_check(cudaMalloc(&m_unit_mass, sizeof(float) * ones.size()));
-            cuda_check(cudaMemcpy(m_unit_mass, ones.data(), sizeof(float) * ones.size(), cudaMemcpyHostToDevice));
-        }
-
-        m_dimension = (DIM == 2) ? 2U : 4U;
+        m_dimension = DIM;
     }
 
 public:
@@ -1938,12 +1277,8 @@ public:
     {
         cudaFree(m_cell_counts);  // Also holds m_blocks_per_cell.
         cudaFree(m_temp_storage);
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            cudaFree(m_block_offsets);
-            cudaFree(m_unit_mass);
-        }
+        cudaFree(m_block_offsets);
+        cudaFree(m_unit_mass);
     }
 
     float eps() const { return m_config.eps; }
@@ -1957,45 +1292,59 @@ public:
 
     uint32_t max_particles_per_block() const { return m_config.MAX_PARTICLES_PER_BLOCK; }
 
+    // Particles to bin together with the scatter pass (fused path).
+    struct Binning
+    {
+        const float *state;
+        const float *mass;
+        ParticlePosition<DIM> *binned_positions;
+        float *binned_state;
+        float *binned_mass;
+        uint32_t features;
+    };
+
     // Counting sort of particles into cells plus grid-block assignment, ordered
-    // on `stream`. Every output entry is written, so only the counters and the
-    // block-info sentinels need clearing.
+    // on `stream`. Every output entry is written (assign_block_info also writes
+    // the sentinel tail), so only the counters need clearing. With `binning`,
+    // the scatter pass also copies positions, states and masses into binned order.
     void initialize_impl(const ParticlePosition<DIM> *d_positions, uint32_t *d_permutation,
-                         uint32_t *d_bin_offsets, BlockInfo *d_block_info, cudaStream_t stream)
+                         uint32_t *d_bin_offsets, BlockInfo *d_block_info, cudaStream_t stream,
+                         const Binning *binning = nullptr)
     {
         uint32_t scan_items = m_config.batch_size * m_config.cell_count + 1;
         cuda_check(cudaMemsetAsync(m_cell_counts, 0, sizeof(uint32_t) * m_counter_words, stream));
 
         dim3 block_dim(256, 1, 1);
         dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-        grid_count_particles<DIM, BC, ST><<<grid_dim, block_dim, 0, stream>>>(
+        grid_count_particles<<<grid_dim, block_dim, 0, stream>>>(
             d_positions, m_cell_counts, m_blocks_per_cell, d_permutation, m_config);
         cuda_check(cudaGetLastError());
 
-        // Compute prefix sum to get bin offsets
-        cuda_check(cub::DeviceScan::ExclusiveSum(
-            m_temp_storage, m_temp_storage_bytes, m_cell_counts, d_bin_offsets, scan_items, stream));
+        // Both prefix sums at once: bin offsets (where each cell starts) and
+        // block offsets (the first grid block of each cell).
+        cuda_check(cub::DeviceScan::ExclusiveScan(
+            m_temp_storage, m_temp_storage_bytes,
+            thrust::make_zip_iterator(thrust::make_tuple(m_cell_counts, m_blocks_per_cell)),
+            thrust::make_zip_iterator(thrust::make_tuple(d_bin_offsets, m_block_offsets)),
+            CounterPairSum{}, thrust::make_tuple(0u, 0u), scan_items, stream));
 
-        // Launch kernel to compute permutation
-        grid_compute_permutation<<<grid_dim, block_dim, 0, stream>>>(
-            d_positions, d_bin_offsets, d_permutation, m_config);
+        // Scatter: binned index of each particle (and the binned copy, fused path)
+        if (binning)
+            grid_scatter_and_bin<<<grid_dim, block_dim, 0, stream>>>(
+                d_positions, binning->state, binning->mass, d_bin_offsets, d_permutation,
+                binning->binned_positions, binning->binned_state, binning->binned_mass,
+                binning->features, m_config);
+        else
+            grid_compute_permutation<<<grid_dim, block_dim, 0, stream>>>(
+                d_positions, d_bin_offsets, d_permutation, m_config);
         cuda_check(cudaGetLastError());
 
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            // Compute prefix sum to get block offsets
-            cuda_check(cub::DeviceScan::ExclusiveSum(
-                m_temp_storage, m_temp_storage_bytes, m_blocks_per_cell, m_block_offsets, scan_items, stream));
-
-            // Unused trailing blocks stay zero-count sentinels.
-            cuda_check(cudaMemsetAsync(d_block_info, 0, sizeof(BlockInfo) * m_max_blocks, stream));
-            // Launch kernel to assign block information
-            block_dim = dim3(256, 1, 1);
-            grid_dim = dim3((m_config.cell_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-            assign_block_info<<<grid_dim, block_dim, 0, stream>>>(
-                m_cell_counts, m_block_offsets, d_block_info, m_config);
-            cuda_check(cudaGetLastError());
-        }
+        // Launch kernel to assign block information (it also clears the unused tail)
+        block_dim = dim3(256, 1, 1);
+        grid_dim = dim3((m_config.cell_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
+        assign_block_info<<<grid_dim, block_dim, 0, stream>>>(
+            m_cell_counts, m_block_offsets, d_block_info, m_config);
+        cuda_check(cudaGetLastError());
     }
 
     void initialize(
@@ -2005,12 +1354,10 @@ public:
         BlockInfoArray block_info // Shape (max_blocks, 4)
     )
     {
-        validate_array_shape(positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "positions");
+        validate_array_shape(positions, per_particle({m_dimension}), "positions");
         validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(permutation, {m_config.batch_size, m_config.particle_count}, "permutation");
-
-        if constexpr (ST == KernelStrategy::GridBased)
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
+        validate_array_shape(permutation, per_particle(), "permutation");
+        validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
 
         initialize_impl(reinterpret_cast<const ParticlePosition<DIM> *>(positions.data()),
                         reinterpret_cast<uint32_t *>(permutation.data()),
@@ -2029,13 +1376,13 @@ public:
     )
     {
         uint32_t feature_dim = input_state.shape(2);
-        validate_array_shape(input_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "input_positions");
-        validate_array_shape(input_state, {m_config.batch_size, m_config.particle_count, feature_dim}, "input_state");
-        validate_array_shape(input_mass, {m_config.batch_size, m_config.particle_count}, "input_mass");
-        validate_array_shape(permutation, {m_config.batch_size, m_config.particle_count}, "permutation");
-        validate_array_shape(output_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "output_positions");
-        validate_array_shape(output_state, {m_config.batch_size, m_config.particle_count, feature_dim}, "output_state");
-        validate_array_shape(output_mass, {m_config.batch_size, m_config.particle_count}, "output_mass");
+        validate_array_shape(input_positions, per_particle({m_dimension}), "input_positions");
+        validate_array_shape(input_state, per_particle({feature_dim}), "input_state");
+        validate_array_shape(input_mass, per_particle(), "input_mass");
+        validate_array_shape(permutation, per_particle(), "permutation");
+        validate_array_shape(output_positions, per_particle({m_dimension}), "output_positions");
+        validate_array_shape(output_state, per_particle({feature_dim}), "output_state");
+        validate_array_shape(output_mass, per_particle(), "output_mass");
 
         // Cast device pointers
         const ParticlePosition<DIM> *d_input_positions = reinterpret_cast<const ParticlePosition<DIM> *>(input_positions.data());
@@ -2061,13 +1408,13 @@ public:
     )
     {
         uint32_t feature_dim = grad_output_state.shape(2);
-        validate_array_shape(grad_output_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "grad_output_positions");
-        validate_array_shape(grad_output_state, {m_config.batch_size, m_config.particle_count, feature_dim}, "grad_output_state");
-        validate_array_shape(grad_output_mass, {m_config.batch_size, m_config.particle_count}, "grad_output_mass");
-        validate_array_shape(permutation, {m_config.batch_size, m_config.particle_count}, "permutation");
-        validate_array_shape(grad_input_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "grad_input_positions");
-        validate_array_shape(grad_input_state, {m_config.batch_size, m_config.particle_count, feature_dim}, "grad_input_state");
-        validate_array_shape(grad_input_mass, {m_config.batch_size, m_config.particle_count}, "grad_input_mass");
+        validate_array_shape(grad_output_positions, per_particle({m_dimension}), "grad_output_positions");
+        validate_array_shape(grad_output_state, per_particle({feature_dim}), "grad_output_state");
+        validate_array_shape(grad_output_mass, per_particle(), "grad_output_mass");
+        validate_array_shape(permutation, per_particle(), "permutation");
+        validate_array_shape(grad_input_positions, per_particle({m_dimension}), "grad_input_positions");
+        validate_array_shape(grad_input_state, per_particle({feature_dim}), "grad_input_state");
+        validate_array_shape(grad_input_mass, per_particle(), "grad_input_mass");
 
         // Cast device pointers
         const ParticlePosition<DIM> *d_grad_output_positions = reinterpret_cast<const ParticlePosition<DIM> *>(grad_output_positions.data());
@@ -2082,7 +1429,7 @@ public:
             feature_dim, m_config);
     }
 
-    // Fused NPA perception (perception.cuh, FUSED_PERCEPTION.md): fixed masses,
+    // Fused NPA perception (fused_perception.cuh, FUSED_PERCEPTION.md): fixed masses,
     // detached positions, native channel counts 4/8/16/32 (sph.py pads others).
     // One forward call builds the grid, bins, and perceives; one backward call
     // propagates the perception adjoint, adds the binned-state cotangent, and
@@ -2120,6 +1467,22 @@ public:
              + size_t(m_config.batch_size) * m_config.particle_count;
     }
 
+    // The snapshot's int32 words: [block_info (max_blocks*4) | bin_offsets (B*cells+1) | permutation (B*N)].
+    struct SnapshotView
+    {
+        BlockInfo *block_info;
+        uint32_t *bin_offsets;
+        uint32_t *permutation;
+    };
+
+    SnapshotView snapshot_view(IntArray1D &snapshot) const
+    {
+        auto *words = reinterpret_cast<uint32_t *>(snapshot.data());
+        uint32_t *bin_offsets = words + size_t(m_max_blocks) * 4;
+        return {reinterpret_cast<BlockInfo *>(words), bin_offsets,
+                bin_offsets + size_t(m_config.batch_size) * m_config.cell_count + 1};
+    }
+
     void fused_perception_forward(
         FloatArray3D positions, FloatArray3D state, std::optional<FloatArray2D> mass, FloatArray1D eps0,
         IntArray1D snapshot, FloatArray3D binned_positions, FloatArray3D binned_state,
@@ -2127,57 +1490,47 @@ public:
         bool perceive_density_grad, bool normalize_state_grad, bool normalize_density_grad,
         bool save_backward, uint64_t stream = 0)
     {
-        if constexpr (ST != KernelStrategy::GridBased) {
-            throw std::runtime_error("Fused perception requires grid mode.");
-        } else {
-            uint32_t features = state.shape(2);
-            uint32_t output_dim = features * (2 + DIM) + (perceive_density_grad ? DIM : 0);
-            FusedWorkspace layout = fused_workspace_layout(
-                features, perceive_density_grad, normalize_state_grad, save_backward, mass.has_value());
-            validate_array_shape(positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "positions");
-            validate_array_shape(state, {m_config.batch_size, m_config.particle_count, features}, "state");
-            if (mass)
-                validate_array_shape(*mass, {m_config.batch_size, m_config.particle_count}, "mass");
-            validate_array_shape(eps0, {1}, "eps0");
-            validate_array_shape(snapshot, {fused_snapshot_words()}, "snapshot");
-            validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-            validate_array_shape(binned_state, {m_config.batch_size, m_config.particle_count, features}, "binned_state");
-            validate_array_shape(perception, {m_config.batch_size, m_config.particle_count, output_dim}, "perception");
-            validate_array_shape(workspace, {layout.size}, "workspace");
-            auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-            auto *block_info = reinterpret_cast<BlockInfo *>(snapshot.data());
-            auto *bin_offsets = reinterpret_cast<uint32_t *>(snapshot.data()) + size_t(m_max_blocks) * 4;
-            uint32_t *permutation = bin_offsets + size_t(m_config.batch_size) * m_config.cell_count + 1;
-            auto *x = reinterpret_cast<const ParticlePosition<DIM> *>(positions.data());
-            auto *x_bin = reinterpret_cast<ParticlePosition<DIM> *>(binned_positions.data());
-            float *base = workspace.data();
-            // Omitted masses read the persistent ones buffer (binned ones are ones).
-            float *mass_bin = mass ? base + layout.mass : m_unit_mass;
+        uint32_t features = state.shape(2);
+        uint32_t output_dim = features * (2 + DIM) + (perceive_density_grad ? DIM : 0);
+        FusedWorkspace layout = fused_workspace_layout(
+            features, perceive_density_grad, normalize_state_grad, save_backward, mass.has_value());
+        validate_array_shape(positions, per_particle({m_dimension}), "positions");
+        validate_array_shape(state, per_particle({features}), "state");
+        if (mass)
+            validate_array_shape(*mass, per_particle(), "mass");
+        validate_array_shape(eps0, {1}, "eps0");
+        validate_array_shape(snapshot, {fused_snapshot_words()}, "snapshot");
+        validate_array_shape(binned_positions, per_particle({m_dimension}), "binned_positions");
+        validate_array_shape(binned_state, per_particle({features}), "binned_state");
+        validate_array_shape(perception, per_particle({output_dim}), "perception");
+        validate_array_shape(workspace, {layout.size}, "workspace");
+        auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+        auto [block_info, bin_offsets, permutation] = snapshot_view(snapshot);
+        auto *x = reinterpret_cast<const ParticlePosition<DIM> *>(positions.data());
+        auto *x_bin = reinterpret_cast<ParticlePosition<DIM> *>(binned_positions.data());
+        float *base = workspace.data();
+        // Omitted masses read the persistent ones buffer (binned ones are ones).
+        float *mass_bin = mass ? base + layout.mass : m_unit_mass;
 
-            initialize_impl(x, permutation, bin_offsets, block_info, cuda_stream);
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-            apply_permutation<<<grid_dim, block_dim, 0, cuda_stream>>>(
-                x, state.data(), mass ? mass->data() : nullptr, permutation,
-                x_bin, binned_state.data(), mass ? mass_bin : nullptr, features, m_config);
+        Binning binning{state.data(), mass ? mass->data() : nullptr, x_bin, binned_state.data(),
+                        mass ? mass_bin : nullptr, features};
+        initialize_impl(x, permutation, bin_offsets, block_info, cuda_stream, &binning);
+        // Explicit masses: per-sample totals normalize the density gradient.
+        const float *total_mass = nullptr;
+        if (mass && perceive_density_grad) {
+            fused_perception::total_mass<<<m_config.batch_size, fused_perception::TOTAL_MASS_THREADS, 0, cuda_stream>>>(
+                mass->data(), m_config.particle_count, base + layout.total_mass);
             cuda_check(cudaGetLastError());
-            // Explicit masses: per-sample totals normalize the density gradient.
-            const float *total_mass = nullptr;
-            if (mass && perceive_density_grad) {
-                fused_perception::total_mass<<<m_config.batch_size, fused_perception::TOTAL_MASS_THREADS, 0, cuda_stream>>>(
-                    mass->data(), m_config.particle_count, base + layout.total_mass);
-                cuda_check(cudaGetLastError());
-                total_mass = base + layout.total_mass;
-            }
-            launch_fused_density(x_bin, mass_bin, base + layout.volume,
-                                 perceive_density_grad ? base + layout.density_gradient : nullptr,
-                                 bin_offsets, block_info, perceive_density_grad, cuda_stream);
-            launch_fused_features(x_bin, binned_state.data(), base + layout.volume,
-                                  base + layout.density_gradient, total_mass, eps0.data(), perception.data(),
-                                  base + layout.gradient_values, base + layout.gradient_sum,
-                                  bin_offsets, block_info, features, perceive_density_grad,
-                                  normalize_state_grad, normalize_density_grad, save_backward, cuda_stream);
+            total_mass = base + layout.total_mass;
         }
+        launch_fused_density(x_bin, mass_bin, base + layout.volume,
+                             perceive_density_grad ? base + layout.density_gradient : nullptr,
+                             bin_offsets, block_info, perceive_density_grad, cuda_stream);
+        launch_fused_features(x_bin, binned_state.data(), base + layout.volume,
+                              base + layout.density_gradient, total_mass, eps0.data(), perception.data(),
+                              base + layout.gradient_values, base + layout.gradient_sum,
+                              bin_offsets, block_info, features, perceive_density_grad,
+                              normalize_state_grad, normalize_density_grad, save_backward, cuda_stream);
     }
 
     void fused_perception_backward(
@@ -2187,81 +1540,100 @@ public:
         std::optional<FloatArray3D> grad_positions, std::optional<FloatArray3D> grad_state, uint32_t features,
         bool perceive_density_grad, bool normalize_state_grad, bool has_mass, uint64_t stream = 0)
     {
-        if constexpr (ST != KernelStrategy::GridBased) {
-            throw std::runtime_error("Fused perception requires grid mode.");
-        } else {
-            uint32_t output_dim = features * (2 + DIM) + (perceive_density_grad ? DIM : 0);
-            size_t particles = size_t(m_config.batch_size) * m_config.particle_count;
-            // The saved forward state is read only for a perception cotangent, in
-            // which case the forward ran with save_backward.
-            FusedWorkspace layout = fused_workspace_layout(
-                features, perceive_density_grad, normalize_state_grad, true, has_mass);
-            validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-            if (grad_perception)
-                validate_array_shape(workspace, {layout.size}, "workspace");
-            validate_array_shape(eps0, {1}, "eps0");
-            validate_array_shape(snapshot, {fused_snapshot_words()}, "snapshot");
-            if (grad_state)
-                validate_array_shape(*grad_state, {m_config.batch_size, m_config.particle_count, features}, "grad_state");
-            if (grad_perception) {
-                validate_array_shape(*grad_perception, {m_config.batch_size, m_config.particle_count, output_dim}, "grad_perception");
-                validate_array_shape(scratch, {particles * features * (DIM + 2)}, "scratch");
-            }
-            if (grad_binned_state)
-                validate_array_shape(*grad_binned_state, {m_config.batch_size, m_config.particle_count, features}, "grad_binned_state");
-            if (grad_state.has_value() != (grad_perception.has_value() || grad_binned_state.has_value()))
-                throw std::runtime_error("grad_state requires a perception or binned-state cotangent, and vice versa");
-            if (grad_positions.has_value() != grad_binned_positions.has_value())
-                throw std::runtime_error("grad_positions and grad_binned_positions must be given together");
-            if (grad_positions) {
-                validate_array_shape(*grad_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "grad_positions");
-                validate_array_shape(*grad_binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "grad_binned_positions");
-            }
-            auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-            auto *block_info = reinterpret_cast<const BlockInfo *>(snapshot.data());
-            auto *bin_offsets = reinterpret_cast<const uint32_t *>(snapshot.data()) + size_t(m_max_blocks) * 4;
-            const uint32_t *permutation = bin_offsets + size_t(m_config.batch_size) * m_config.cell_count + 1;
-            const float *base = workspace.data();
-            // Binned perception adjoint first; the binned-state cotangent is added
-            // while unbinning (the sum autograd would otherwise form).
-            const float *state_source = grad_binned_state ? grad_binned_state->data() : nullptr;
-            const float *state_addend = nullptr;
-            if (grad_perception) {
-                // scratch: [incoming cotangents (B*N*(DIM+1)*C) | binned state adjoint (B*N*C)]
-                float *perception_grad_state = scratch.data() + particles * features * (DIM + 1);
-                launch_fused_backward(
-                    reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data()), base + layout.volume,
-                    grad_perception->data(), base + layout.gradient_values, base + layout.gradient_sum, eps0.data(),
-                    scratch.data(), perception_grad_state, bin_offsets, block_info, features,
-                    perceive_density_grad, normalize_state_grad, cuda_stream);
-                state_addend = state_source;
-                state_source = perception_grad_state;
-            }
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-            backward_apply_permutation<<<grid_dim, block_dim, 0, cuda_stream>>>(
-                grad_binned_positions ? reinterpret_cast<const ParticlePosition<DIM> *>(grad_binned_positions->data()) : nullptr,
-                state_source, nullptr, permutation,
-                grad_positions ? reinterpret_cast<ParticlePosition<DIM> *>(grad_positions->data()) : nullptr,
-                grad_state ? grad_state->data() : nullptr, nullptr, features, m_config, state_addend);
-            cuda_check(cudaGetLastError());
+        uint32_t output_dim = features * (2 + DIM) + (perceive_density_grad ? DIM : 0);
+        size_t particles = size_t(m_config.batch_size) * m_config.particle_count;
+        // The saved forward state is read only for a perception cotangent, in
+        // which case the forward ran with save_backward.
+        FusedWorkspace layout = fused_workspace_layout(
+            features, perceive_density_grad, normalize_state_grad, true, has_mass);
+        validate_array_shape(binned_positions, per_particle({m_dimension}), "binned_positions");
+        if (grad_perception)
+            validate_array_shape(workspace, {layout.size}, "workspace");
+        validate_array_shape(eps0, {1}, "eps0");
+        validate_array_shape(snapshot, {fused_snapshot_words()}, "snapshot");
+        if (grad_state)
+            validate_array_shape(*grad_state, per_particle({features}), "grad_state");
+        if (grad_perception) {
+            validate_array_shape(*grad_perception, per_particle({output_dim}), "grad_perception");
+            validate_array_shape(scratch, {particles * features * (DIM + 2)}, "scratch");
         }
+        if (grad_binned_state)
+            validate_array_shape(*grad_binned_state, per_particle({features}), "grad_binned_state");
+        if (grad_state.has_value() != (grad_perception.has_value() || grad_binned_state.has_value()))
+            throw std::runtime_error("grad_state requires a perception or binned-state cotangent, and vice versa");
+        if (grad_positions.has_value() != grad_binned_positions.has_value())
+            throw std::runtime_error("grad_positions and grad_binned_positions must be given together");
+        if (grad_positions) {
+            validate_array_shape(*grad_positions, per_particle({m_dimension}), "grad_positions");
+            validate_array_shape(*grad_binned_positions, per_particle({m_dimension}), "grad_binned_positions");
+        }
+        auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+        auto [block_info, bin_offsets, permutation] = snapshot_view(snapshot);
+        const float *base = workspace.data();
+        // Binned perception adjoint first; the binned-state cotangent is added
+        // while unbinning (the sum autograd would otherwise form).
+        const float *state_source = grad_binned_state ? grad_binned_state->data() : nullptr;
+        const float *state_addend = nullptr;
+        if (grad_perception) {
+            // scratch: [incoming cotangents (B*N*(DIM+1)*C) | binned state adjoint (B*N*C)]
+            float *perception_grad_state = scratch.data() + particles * features * (DIM + 1);
+            launch_fused_backward(
+                reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data()), base + layout.volume,
+                grad_perception->data(), base + layout.gradient_values, base + layout.gradient_sum, eps0.data(),
+                scratch.data(), perception_grad_state, bin_offsets, block_info, features,
+                perceive_density_grad, normalize_state_grad, cuda_stream);
+            state_addend = state_source;
+            state_source = perception_grad_state;
+        }
+        dim3 block_dim(256, 1, 1);
+        dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
+        backward_apply_permutation<<<grid_dim, block_dim, 0, cuda_stream>>>(
+            grad_binned_positions ? reinterpret_cast<const ParticlePosition<DIM> *>(grad_binned_positions->data()) : nullptr,
+            state_source, nullptr, permutation,
+            grad_positions ? reinterpret_cast<ParticlePosition<DIM> *>(grad_positions->data()) : nullptr,
+            grad_state ? grad_state->data() : nullptr, nullptr, features, m_config, state_addend);
+        cuda_check(cudaGetLastError());
     }
 
 private:
+    // Grid size of a persistent fused kernel: eight waves of resident CUDA blocks
+    // (occupancy queried once per kernel), never more than the grid blocks.
+    template <typename Kernel>
+    unsigned int persistent_grid(Kernel kernel, int threads) const
+    {
+        static std::map<const void *, unsigned int> cache;
+        auto key = reinterpret_cast<const void *>(kernel);
+        auto found = cache.find(key);
+        if (found == cache.end())
+        {
+            int device = 0, sms = 0, per_sm = 0;
+            cuda_check(cudaGetDevice(&device));
+            cuda_check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+            cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, 0));
+            found = cache.emplace(key, 8u * static_cast<unsigned int>(sms) * static_cast<unsigned int>(per_sm > 0 ? per_sm : 1)).first;
+        }
+        return min(found->second, m_max_blocks);
+    }
+
     // Fused-perception launch helpers; pointers are in binned particle order.
     void launch_fused_density(
         const ParticlePosition<DIM> *positions, const float *mass, float *volume, float *density_gradient,
         const uint32_t *bin_offsets, const BlockInfo *block_info, bool perceive_density_grad, cudaStream_t stream)
     {
         if (perceive_density_grad)
-            fused_perception::density_forward<DIM, BC, true>
-                <<<m_max_blocks, fused_perception::DensityLayout<DIM, true>::THREADS, 0, stream>>>(
-                    positions, mass, volume, density_gradient, bin_offsets, block_info, m_config);
+        {
+            auto kernel = fused_perception::density_forward<DIM, BC, true>;
+            constexpr int THREADS = fused_perception::DensityLayout<DIM, true>::THREADS;
+            kernel<<<persistent_grid(kernel, THREADS), THREADS, 0, stream>>>(
+                positions, mass, volume, density_gradient, bin_offsets, block_info, m_config);
+        }
         else
-            fused_perception::density_forward<DIM, BC, false>
-                <<<m_max_blocks, fused_perception::DensityLayout<DIM, false>::THREADS, 0, stream>>>(
-                    positions, mass, volume, nullptr, bin_offsets, block_info, m_config);
+        {
+            auto kernel = fused_perception::density_forward<DIM, BC, false>;
+            constexpr int THREADS = fused_perception::DensityLayout<DIM, false>::THREADS;
+            kernel<<<persistent_grid(kernel, THREADS), THREADS, 0, stream>>>(
+                positions, mass, volume, nullptr, bin_offsets, block_info, m_config);
+        }
         cuda_check(cudaGetLastError());
     }
 
@@ -2291,7 +1663,8 @@ private:
         dispatch_features(features, [&](auto feature_count) {
             constexpr int FEATURES = decltype(feature_count)::value;
             constexpr int THREADS = fused_perception::ForwardLayout<DIM, FEATURES>::THREADS;
-            fused_perception::forward<DIM, FEATURES, BC><<<m_max_blocks, THREADS, 0, stream>>>(
+            auto kernel = fused_perception::forward<DIM, FEATURES, BC>;
+            kernel<<<persistent_grid(kernel, THREADS), THREADS, 0, stream>>>(
                 positions, state, volume, density_gradient, total_mass, eps0, perception, gradient_values, gradient_sum,
                 bin_offsets, block_info, m_config,
                 perceive_density_grad, normalize_state_grad, normalize_density_grad, save_backward);
@@ -2316,1114 +1689,352 @@ private:
                 incoming, grad_state, particles, output_dim, m_config.eps, normalize_state_grad);
             cuda_check(cudaGetLastError());
             constexpr int THREADS = fused_perception::BackwardLayout<DIM, FEATURES>::THREADS;
-            fused_perception::backward<DIM, FEATURES, BC><<<m_max_blocks, THREADS, 0, stream>>>(
+            auto kernel = fused_perception::backward<DIM, FEATURES, BC>;
+            kernel<<<persistent_grid(kernel, THREADS), THREADS, 0, stream>>>(
                 positions, volume, incoming, grad_state, bin_offsets, block_info, m_config);
         });
         cuda_check(cudaGetLastError());
     }
 
+private:
+    // Device pointers of one standalone-operator launch; unused fields stay null.
+    struct OperatorArgs
+    {
+        const ParticlePosition<DIM> *positions = nullptr;
+        const uint32_t *bin_offsets = nullptr;
+        const BlockInfo *block_info = nullptr;
+        const float *rho = nullptr;
+        const float *mass = nullptr;
+        const float *state = nullptr;
+        uint32_t feature_dim = 0;
+        // Forward outputs.
+        float *rho_out = nullptr;
+        float *count_out = nullptr;
+        float *blur_out = nullptr;
+        float *gradient_out = nullptr;
+        float *density_gradient_out = nullptr;
+        float *moment_matrix_out = nullptr;
+        // Backward: the operator output's cotangent, then the input adjoints.
+        const float *dL_rho = nullptr;
+        const float *dL_blur = nullptr;
+        const float *dL_gradient = nullptr;
+        const float *dL_density_gradient = nullptr;
+        const float *dL_moment_matrix = nullptr;
+        ParticlePosition<DIM> *grad_positions = nullptr;
+        float *grad_rho = nullptr;
+        float *grad_state = nullptr;
+    };
+
+    // Shape (batch_size, N, trailing...) of a per-particle array.
+    std::vector<size_t> per_particle(std::initializer_list<size_t> trailing = {}) const
+    {
+        std::vector<size_t> shape{m_config.batch_size, m_config.particle_count};
+        shape.insert(shape.end(), trailing);
+        return shape;
+    }
+
+    // Checks the binned positions and snapshot arrays that every operator takes.
+    OperatorArgs operator_args(const FloatArray3D &binned_positions, const IntArray1D &bin_offsets,
+                               const BlockInfoArray &block_info) const
+    {
+        validate_array_shape(binned_positions, per_particle({m_dimension}), "binned_positions");
+        validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
+        validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
+        OperatorArgs args;
+        args.positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
+        args.bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
+        args.block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
+        return args;
+    }
+
+    // One CUDA block of THREADS per grid block, STRIDE particles per shared-memory tile.
+    template <ComputationType TYPE, int STRIDE, int THREADS>
+    void launch_forward(const OperatorArgs &a, size_t shared_floats) const
+    {
+        forward_kernel<DIM, TYPE, STRIDE, BC><<<m_max_blocks, THREADS, shared_floats * sizeof(float)>>>(
+            a.positions, a.rho, a.mass, a.state, a.rho_out, a.count_out, a.blur_out, a.gradient_out,
+            a.density_gradient_out, a.moment_matrix_out, a.feature_dim, a.bin_offsets, a.block_info, m_config);
+        cuda_check(cudaGetLastError());
+    }
+
+    // DS_ONLY computes only the state adjoint (blur and gradient).
+    template <ComputationType TYPE, int STRIDE, int THREADS, bool DS_ONLY = false>
+    void launch_backward(const OperatorArgs &a, size_t shared_floats) const
+    {
+        backward_kernel<DIM, TYPE, STRIDE, BC, DS_ONLY><<<m_max_blocks, THREADS, shared_floats * sizeof(float)>>>(
+            a.positions, a.rho, a.mass, a.state, a.dL_rho, nullptr, a.dL_blur, a.dL_gradient,
+            a.dL_density_gradient, a.dL_moment_matrix, a.grad_positions, a.grad_rho, a.grad_state,
+            a.feature_dim, a.bin_offsets, a.block_info, m_config);
+        cuda_check(cudaGetLastError());
+    }
+
 public:
+    // Standalone SPH operators on binned particles. Shapes: positions (B, N, DIM),
+    // mass, rho and count (B, N), states (B, N, C), bin_offsets (B * cells + 1),
+    // block_info (max_blocks, 4). Shared-memory sizes are floats per tile slot.
 
-    void density_forward(
-        FloatArray3D binned_positions, // Shape (batch_size, N, DIM)
-        FloatArray2D mass,             // Input mass, Shape (batch_size, N)
-        FloatArray2D rho,              // Output density, Shape (batch_size, N)
-        IntArray1D bin_offsets,        // Shape (batch_size * cell_count + 1)
-        BlockInfoArray block_info      // Output block info, Shape (max_blocks, 4)
-    )
+    void density_forward(FloatArray3D binned_positions, FloatArray2D mass, FloatArray2D rho,
+                         IntArray1D bin_offsets, BlockInfoArray block_info)
     {
-        validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-        validate_array_shape(mass, {m_config.batch_size, m_config.particle_count}, "mass");
-        validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(rho, {m_config.batch_size, m_config.particle_count}, "rho");
-        if constexpr (ST == KernelStrategy::GridBased)
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
-
-        // Cast device pointers
-        const ParticlePosition<DIM> *d_binned_positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
-        const uint32_t *d_bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
-        const float *d_mass = mass.data();
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            const BlockInfo *d_block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
-            dim3 block_dim(128, 1, 1);
-            dim3 grid_dim(m_max_blocks, 1, 1);
-
-            // determine shared memory size
-            const int STRIDE = 128;
-            size_t smem_size = STRIDE * 2 * sizeof(float); // local_buffer + neighbor_mass
-
-            forward_kernel<DIM, ComputationType::Density, STRIDE><<<grid_dim, block_dim, smem_size>>>(
-                d_binned_positions, // Input binned positions
-                nullptr,            // No input density
-                d_mass,             // Input mass
-                nullptr,            // No input state
-                rho.data(),         // Output density
-                nullptr,            // No count output
-                nullptr,            // No blur state output
-                nullptr,            // No grad state output
-                nullptr,            // No grad density output
-                nullptr,            // No moment matrix output
-                0,                  // No feature dim
-                d_bin_offsets,      // Bin offsets
-                d_block_info,       // Block info
-                m_config);
-        }
-        else
-        {
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-            vanilla_forward_kernel<DIM, ComputationType::Density, 0><<<grid_dim, block_dim>>>(
-                d_binned_positions, // Input binned positions
-                nullptr,            // No input density
-                d_mass,             // Input mass
-                nullptr,            // No input state
-                rho.data(),         // Output density
-                nullptr,            // No count output
-                nullptr,            // No blur state output
-                nullptr,            // No grad state output
-                nullptr,            // No grad density output
-                nullptr,            // No moment matrix output
-                0,                  // No feature dim
-                d_bin_offsets,      // Bin offsets
-                m_config);
-        }
+        OperatorArgs args = operator_args(binned_positions, bin_offsets, block_info);
+        validate_array_shape(mass, per_particle(), "mass");
+        validate_array_shape(rho, per_particle(), "rho");
+        args.mass = mass.data();
+        args.rho_out = rho.data();
+        launch_forward<ComputationType::Density, 128, 128>(args, 128 * 2); // output, neighbor mass
     }
 
-    void count_forward(
-        FloatArray3D binned_positions, // Shape (batch_size, N, DIM)
-        FloatArray2D count,            // Output count, Shape (batch_size, N)
-        IntArray1D bin_offsets,        // Shape (batch_size * cell_count + 1)
-        BlockInfoArray block_info      // Output block info, Shape (max_blocks, 4)
-    )
+    void count_forward(FloatArray3D binned_positions, FloatArray2D count,
+                       IntArray1D bin_offsets, BlockInfoArray block_info)
     {
-        validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-        validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(count, {m_config.batch_size, m_config.particle_count}, "count");
-        if constexpr (ST == KernelStrategy::GridBased)
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
-
-        // Cast device pointers
-        const ParticlePosition<DIM> *d_binned_positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
-        const uint32_t *d_bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            const BlockInfo *d_block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
-            dim3 block_dim(128, 1, 1);
-            dim3 grid_dim(m_max_blocks, 1, 1);
-
-            const int STRIDE = 128;
-            size_t smem_size = STRIDE * sizeof(float); // for local_buffer
-            forward_kernel<DIM, ComputationType::Count, STRIDE><<<grid_dim, block_dim, smem_size>>>(
-                d_binned_positions, // Input binned positions
-                nullptr,            // No input density
-                nullptr,            // No input mass
-                nullptr,            // No input state
-                nullptr,            // No output density
-                count.data(),       // Output count
-                nullptr,            // No blur state output
-                nullptr,            // No grad state output
-                nullptr,            // No grad density output
-                nullptr,            // No moment matrix output
-                0,                  // No feature dim
-                d_bin_offsets,      // Bin offsets
-                d_block_info,       // Block info
-                m_config);
-        }
-        else
-        {
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-            vanilla_forward_kernel<DIM, ComputationType::Count, 0><<<grid_dim, block_dim>>>(
-                d_binned_positions, // Input binned positions
-                nullptr,            // No input density
-                nullptr,            // No input mass
-                nullptr,            // No input state
-                nullptr,            // No output density
-                count.data(),       // Output count
-                nullptr,            // No blur state output
-                nullptr,            // No grad state output
-                nullptr,            // No grad density output
-                nullptr,            // No moment matrix output
-                0,                  // No feature dim
-                d_bin_offsets,      // Bin offsets
-                m_config);
-        }
+        OperatorArgs args = operator_args(binned_positions, bin_offsets, block_info);
+        validate_array_shape(count, per_particle(), "count");
+        args.count_out = count.data();
+        launch_forward<ComputationType::Count, 128, 128>(args, 128); // output
     }
 
-    void blur_forward(
-        FloatArray3D binned_positions, // Shape (batch_size, N, DIM)
-        FloatArray2D rho,              // Input density, Shape (batch_size, N)
-        FloatArray2D mass,             // Input mass, Shape (batch_size, N)
-        FloatArray3D state_in,         // Input state, Shape (batch_size, N, feature_dim)
-        FloatArray3D state_out,        // Output state, Shape (batch_size, N, feature_dim)
-        IntArray1D bin_offsets,        // Shape (batch_size * cell_count + 1)
-        BlockInfoArray block_info      // Output block info, Shape (max_blocks, 4)
-    )
+    void blur_forward(FloatArray3D binned_positions, FloatArray2D rho, FloatArray2D mass, FloatArray3D state_in,
+                      FloatArray3D state_out, IntArray1D bin_offsets, BlockInfoArray block_info)
     {
         uint32_t feature_dim = state_in.shape(2);
-        validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-        validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(rho, {m_config.batch_size, m_config.particle_count}, "rho");
-        validate_array_shape(mass, {m_config.batch_size, m_config.particle_count}, "mass");
-        validate_array_shape(state_in, {m_config.batch_size, m_config.particle_count, feature_dim}, "state_in");
-        validate_array_shape(state_out, {m_config.batch_size, m_config.particle_count, feature_dim}, "state_out");
-        if constexpr (ST == KernelStrategy::GridBased)
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
-
-        // Cast device pointers
-        const ParticlePosition<DIM> *d_binned_positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
-        const uint32_t *d_bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
-        const float *d_mass = mass.data();
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            // Cast block info
-            const BlockInfo *d_block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim(m_max_blocks, 1, 1);
-            const int STRIDE = 64;
-            size_t smem_size = STRIDE * (feature_dim + feature_dim + 2) * sizeof(float); // + neighbor_mass
-            forward_kernel<DIM, ComputationType::Blur, STRIDE><<<grid_dim, block_dim, smem_size>>>(
-                d_binned_positions, // Input binned positions
-                rho.data(),         // Input density
-                d_mass,             // Input mass
-                state_in.data(),    // Input state
-                nullptr,            // No output density
-                nullptr,            // No count output
-                state_out.data(),   // Output blur state
-                nullptr,            // No grad state output
-                nullptr,            // No grad density output
-                nullptr,            // No moment matrix output
-                feature_dim,        // Feature dimension
-                d_bin_offsets,      // Bin offsets
-                d_block_info,       // Block info
-                m_config);
-        }
-        else
-        {
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-
-            auto launch_blur_kernel = [&](auto max_features)
-            {
-                vanilla_forward_kernel<DIM, ComputationType::Blur, max_features><<<grid_dim, block_dim>>>(
-                    d_binned_positions, // Input binned positions
-                    rho.data(),         // Input density
-                    d_mass,             // Input mass
-                    state_in.data(),    // Input state
-                    nullptr,            // No output density
-                    nullptr,            // No count output
-                    state_out.data(),   // Output blur state
-                    nullptr,            // No grad state output
-                    nullptr,            // No grad density output
-                    nullptr,            // No moment matrix output
-                    feature_dim,        // Feature dimension
-                    d_bin_offsets,      // Bin offsets
-                    m_config);
-            };
-            if (feature_dim <= 8)
-                launch_blur_kernel(std::integral_constant<int, 8>{});
-            else if (feature_dim <= 16)
-                launch_blur_kernel(std::integral_constant<int, 16>{});
-            else if (feature_dim <= 32)
-                launch_blur_kernel(std::integral_constant<int, 32>{});
-            else if (feature_dim <= 48)
-                launch_blur_kernel(std::integral_constant<int, 48>{});
-            else if (feature_dim <= 64)
-                launch_blur_kernel(std::integral_constant<int, 64>{});
-            else
-                throw std::runtime_error("feature_dim exceeds maximum supported value of 32.");
-        }
+        OperatorArgs args = operator_args(binned_positions, bin_offsets, block_info);
+        validate_array_shape(rho, per_particle(), "rho");
+        validate_array_shape(mass, per_particle(), "mass");
+        validate_array_shape(state_in, per_particle({feature_dim}), "state_in");
+        validate_array_shape(state_out, per_particle({feature_dim}), "state_out");
+        args.rho = rho.data();
+        args.mass = mass.data();
+        args.state = state_in.data();
+        args.blur_out = state_out.data();
+        args.feature_dim = feature_dim;
+        // output, neighbor states, neighbor volume and mass
+        launch_forward<ComputationType::Blur, 64, 256>(args, 64 * (feature_dim + feature_dim + 2));
     }
 
-    void gradient_forward(
-        FloatArray3D binned_positions,   // Shape (batch_size, N, DIM)
-        FloatArray2D rho,                // Input density, Shape (batch_size, N)
-        FloatArray2D mass,               // Input mass, Shape (batch_size, N)
-        FloatArray3D state_in,           // Input state, Shape (batch_size, N, feature_dim)
-        FloatArray4D state_gradient_out, // Output state gradient, Shape (batch_size, N, feature_dim, DIM)
-        IntArray1D bin_offsets,          // Shape (batch_size * cell_count + 1)
-        BlockInfoArray block_info        // Output block info, Shape (max_blocks, 4)
-    )
+    void gradient_forward(FloatArray3D binned_positions, FloatArray2D rho, FloatArray2D mass, FloatArray3D state_in,
+                          FloatArray4D state_gradient_out, IntArray1D bin_offsets, BlockInfoArray block_info)
     {
         uint32_t feature_dim = state_in.shape(2);
-        validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-        validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(rho, {m_config.batch_size, m_config.particle_count}, "rho");
-        validate_array_shape(mass, {m_config.batch_size, m_config.particle_count}, "mass");
-        validate_array_shape(state_in, {m_config.batch_size, m_config.particle_count, feature_dim}, "state_in");
-        validate_array_shape(state_gradient_out, {m_config.batch_size, m_config.particle_count, feature_dim, DIM}, "state_gradient_out");
-        if constexpr (ST == KernelStrategy::GridBased)
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
-
-        // Cast device pointers
-        const ParticlePosition<DIM> *d_binned_positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
-        const uint32_t *d_bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
-        const float *d_mass = mass.data();
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            const BlockInfo *d_block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim(m_max_blocks, 1, 1);
-            const int STRIDE = 64;
-            size_t smem_size = STRIDE * (feature_dim * DIM + feature_dim + feature_dim + 2) * sizeof(float); // + neighbor_mass
-
-            forward_kernel<DIM, ComputationType::Gradient, STRIDE><<<grid_dim, block_dim, smem_size>>>(
-                d_binned_positions,        // Input binned positions
-                rho.data(),                // Input density
-                d_mass,                    // Input mass
-                state_in.data(),           // Input state
-                nullptr,                   // No output density
-                nullptr,                   // No count output
-                nullptr,                   // No blur state output
-                state_gradient_out.data(), // Output grad state
-                nullptr,                   // No grad density output
-                nullptr,                   // No moment matrix output
-                feature_dim,               // Feature dimension
-                d_bin_offsets,             // Bin offsets
-                d_block_info,              // Block info
-                m_config);
-        }
-        else
-        {
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-
-            auto launch_gradient_kernel = [&](auto max_features)
-            {
-                vanilla_forward_kernel<DIM, ComputationType::Gradient, max_features><<<grid_dim, block_dim>>>(
-                    d_binned_positions,        // Input binned positions
-                    rho.data(),                // Input density
-                    d_mass,                    // Input mass
-                    state_in.data(),           // Input state
-                    nullptr,                   // No output density
-                    nullptr,                   // No count output
-                    nullptr,                   // No blur state output
-                    state_gradient_out.data(), // Output grad state
-                    nullptr,                   // No grad density output
-                    nullptr,                   // No moment matrix output
-                    feature_dim,               // Feature dimension
-                    d_bin_offsets,             // Bin offsets
-                    m_config);
-            };
-            if (feature_dim <= 8)
-                launch_gradient_kernel(std::integral_constant<int, 8>{});
-            else if (feature_dim <= 16)
-                launch_gradient_kernel(std::integral_constant<int, 16>{});
-            else if (feature_dim <= 32)
-                launch_gradient_kernel(std::integral_constant<int, 32>{});
-            else if (feature_dim <= 48)
-                launch_gradient_kernel(std::integral_constant<int, 48>{});
-            else if (feature_dim <= 64)
-                launch_gradient_kernel(std::integral_constant<int, 64>{});
-            else
-                throw std::runtime_error("feature_dim exceeds maximum supported value of 32.");
-        }
+        OperatorArgs args = operator_args(binned_positions, bin_offsets, block_info);
+        validate_array_shape(rho, per_particle(), "rho");
+        validate_array_shape(mass, per_particle(), "mass");
+        validate_array_shape(state_in, per_particle({feature_dim}), "state_in");
+        validate_array_shape(state_gradient_out, per_particle({feature_dim, DIM}), "state_gradient_out");
+        args.rho = rho.data();
+        args.mass = mass.data();
+        args.state = state_in.data();
+        args.gradient_out = state_gradient_out.data();
+        args.feature_dim = feature_dim;
+        // output, neighbor and local states, neighbor volume and mass
+        launch_forward<ComputationType::Gradient, 64, 256>(args, 64 * (feature_dim * DIM + feature_dim + feature_dim + 2));
     }
 
-    void density_gradient_forward(
-        FloatArray3D binned_positions,     // Shape (batch_size, N, DIM)
-        FloatArray2D mass,                 // Input mass, Shape (batch_size, N)
-        FloatArray3D density_gradient_out, // Output density gradient, Shape (batch_size, N, DIM)
-        IntArray1D bin_offsets,            // Shape (batch_size * cell_count + 1)
-        BlockInfoArray block_info          // Output block info, Shape (max_blocks, 4)
-    )
+    void density_gradient_forward(FloatArray3D binned_positions, FloatArray2D mass, FloatArray3D density_gradient_out,
+                                  IntArray1D bin_offsets, BlockInfoArray block_info)
     {
-        validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-        validate_array_shape(mass, {m_config.batch_size, m_config.particle_count}, "mass");
-        validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(density_gradient_out, {m_config.batch_size, m_config.particle_count, DIM}, "density_gradient_out");
-        if constexpr (ST == KernelStrategy::GridBased)
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
-
-        // Cast device pointers
-        const ParticlePosition<DIM> *d_binned_positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
-        const uint32_t *d_bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
-        const float *d_mass = mass.data();
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            const BlockInfo *d_block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
-            dim3 block_dim(128, 1, 1);
-            dim3 grid_dim(m_max_blocks, 1, 1);
-            const int STRIDE = 128;
-            size_t smem_size = STRIDE * (DIM + 1) * sizeof(float); // + neighbor_mass
-            forward_kernel<DIM, ComputationType::DensityGradient, STRIDE><<<grid_dim, block_dim, smem_size>>>(
-                d_binned_positions,          // Input binned positions
-                nullptr,                     // No input density
-                d_mass,                      // Input mass
-                nullptr,                     // No input state
-                nullptr,                     // No output density
-                nullptr,                     // No count output
-                nullptr,                     // No blur state output
-                nullptr,                     // No grad state output
-                density_gradient_out.data(), // Output density gradient
-                nullptr,                     // No moment matrix output
-                0,                           // No feature dim
-                d_bin_offsets,               // Bin offsets
-                d_block_info,                // Block info
-                m_config);
-        }
-        else
-        {
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-            vanilla_forward_kernel<DIM, ComputationType::DensityGradient, 0><<<grid_dim, block_dim>>>(
-                d_binned_positions,          // Input binned positions
-                nullptr,                     // No input density
-                d_mass,                      // Input mass
-                nullptr,                     // No input state
-                nullptr,                     // No output density
-                nullptr,                     // No count output
-                nullptr,                     // No blur state output
-                nullptr,                     // No grad state output
-                density_gradient_out.data(), // Output density gradient
-                nullptr,                     // No moment matrix output
-                0,                           // No feature dim
-                d_bin_offsets,               // Bin offsets
-                m_config);
-        }
+        OperatorArgs args = operator_args(binned_positions, bin_offsets, block_info);
+        validate_array_shape(mass, per_particle(), "mass");
+        validate_array_shape(density_gradient_out, per_particle({DIM}), "density_gradient_out");
+        args.mass = mass.data();
+        args.density_gradient_out = density_gradient_out.data();
+        launch_forward<ComputationType::DensityGradient, 128, 128>(args, 128 * (DIM + 1)); // output, neighbor mass
     }
 
-    void moment_matrix_forward(
-        FloatArray3D binned_positions,  // Shape (batch_size, N, DIM)
-        FloatArray2D rho,               // Input density, Shape (batch_size, N)
-        FloatArray2D mass,              // Input mass, Shape (batch_size, N)
-        FloatArray4D moment_matrix_out, // Output moment matrix, Shape (batch_size, N, DIM, DIM)
-        IntArray1D bin_offsets,         // Shape (batch_size * cell_count + 1)
-        BlockInfoArray block_info       // Output block info, Shape (max_blocks, 4)
-    )
+    void moment_matrix_forward(FloatArray3D binned_positions, FloatArray2D rho, FloatArray2D mass,
+                               FloatArray4D moment_matrix_out, IntArray1D bin_offsets, BlockInfoArray block_info)
     {
-        validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-        validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(rho, {m_config.batch_size, m_config.particle_count}, "rho");
-        validate_array_shape(mass, {m_config.batch_size, m_config.particle_count}, "mass");
-        validate_array_shape(moment_matrix_out, {m_config.batch_size, m_config.particle_count, DIM, DIM}, "moment_matrix_out");
-        if constexpr (ST == KernelStrategy::GridBased)
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
-
-        // Cast device pointers
-        const ParticlePosition<DIM> *d_binned_positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
-        const uint32_t *d_bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
-        const float *d_mass = mass.data();
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            const BlockInfo *d_block_info = reinterpret_cast<const BlockInfo *>(block_info.data());
-            dim3 block_dim(128, 1, 1);
-            dim3 grid_dim(m_max_blocks, 1, 1);
-            const int STRIDE = 128;
-            size_t smem_size = STRIDE * (DIM * DIM + 2) * sizeof(float); // + neighbor_mass
-            forward_kernel<DIM, ComputationType::MomentMatrix, STRIDE><<<grid_dim, block_dim, smem_size>>>(
-                d_binned_positions,       // Input binned positions
-                rho.data(),               // Input density
-                d_mass,                   // Input mass
-                nullptr,                  // No input state
-                nullptr,                  // No output density
-                nullptr,                  // No count output
-                nullptr,                  // No blur state output
-                nullptr,                  // No grad state output
-                nullptr,                  // No grad density output
-                moment_matrix_out.data(), // Output moment matrix
-                0,                        // No feature dim
-                d_bin_offsets,            // Bin offsets
-                d_block_info,             // Block info
-                m_config);
-        }
-        else
-        {
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-            vanilla_forward_kernel<DIM, ComputationType::MomentMatrix, 0><<<grid_dim, block_dim>>>(
-                d_binned_positions,       // Input binned positions
-                rho.data(),               // Input density
-                d_mass,                   // Input mass
-                nullptr,                  // No input state
-                nullptr,                  // No output density
-                nullptr,                  // No count output
-                nullptr,                  // No blur state output
-                nullptr,                  // No grad state output
-                nullptr,                  // No grad density output
-                moment_matrix_out.data(), // Output moment matrix
-                0,                        // No feature dim
-                d_bin_offsets,            // Bin offsets
-                m_config);
-        }
+        OperatorArgs args = operator_args(binned_positions, bin_offsets, block_info);
+        validate_array_shape(rho, per_particle(), "rho");
+        validate_array_shape(mass, per_particle(), "mass");
+        validate_array_shape(moment_matrix_out, per_particle({DIM, DIM}), "moment_matrix_out");
+        args.rho = rho.data();
+        args.mass = mass.data();
+        args.moment_matrix_out = moment_matrix_out.data();
+        launch_forward<ComputationType::MomentMatrix, 128, 128>(args, 128 * (DIM * DIM + 2)); // output, neighbor volume and mass
     }
 
-    void density_backward(
-        FloatArray3D binned_positions, // Shape (batch_size, N, DIM)
-        FloatArray2D mass,             // Input mass, Shape (batch_size, N)
-        FloatArray2D dL_rho_out,       // Gradient of output density, Shape (batch_size, N)
-        FloatArray3D grad_x,           // Backward gradient w.r.t to position Shape (batch_size, N, DIM)
-        IntArray1D bin_offsets,        // Shape (batch_size * cell_count + 1)
-        BlockInfoArray block_info,     // Shape (max_blocks, 4)
-        bool dLdx = true               // Whether to compute gradient w.r.t. position
-    )
+    // Backward operators: the dL* flags select the input adjoints. Every adjoint
+    // pointer is passed; only the requested ones are shape-checked.
+
+    void density_backward(FloatArray3D binned_positions, FloatArray2D mass, FloatArray2D dL_rho_out, FloatArray3D grad_x,
+                          IntArray1D bin_offsets, BlockInfoArray block_info, bool dLdx = true)
     {
         if (!dLdx)
-            return; // No gradient to compute
-
-        validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-        validate_array_shape(mass, {m_config.batch_size, m_config.particle_count}, "mass");
-        validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(dL_rho_out, {m_config.batch_size, m_config.particle_count}, "grad_output_rho");
-        validate_array_shape(grad_x, {m_config.batch_size, m_config.particle_count, m_dimension}, "grad_x");
-        if constexpr (ST == KernelStrategy::GridBased)
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
-
-        // Cast device pointers
-        const ParticlePosition<DIM> *d_binned_positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
-        const uint32_t *d_bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
-        const float *d_mass = mass.data();
-        ParticlePosition<DIM> *d_grad_x = reinterpret_cast<ParticlePosition<DIM> *>(grad_x.data());
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            BlockInfo *d_block_info = reinterpret_cast<BlockInfo *>(block_info.data());
-            dim3 block_dim(128, 1, 1);
-            dim3 grid_dim(m_max_blocks, 1, 1);
-            const int STRIDE = 128;
-            size_t smem_size = STRIDE * (1 + 1 + 2 + DIM) * sizeof(float); // local_mass and neighbor_mass
-            backward_kernel<DIM, ComputationType::Density, STRIDE><<<grid_dim, block_dim, smem_size>>>(
-                d_binned_positions, // Input binned positions
-                nullptr,            // No input density
-                d_mass,             // Input mass
-                nullptr,            // No input state
-                dL_rho_out.data(),  // Gradient of output density
-                nullptr,            // No gradient of output count
-                nullptr,            // No gradient of output blur state
-                nullptr,            // No gradient of state gradient
-                nullptr,            // No gradient of density gradient
-                nullptr,            // No gradient of moment matrix
-                d_grad_x,           // Gradient w.r.t. position
-                nullptr,            // No backward w.r.t. rho
-                nullptr,            // No backward w.r.t. state
-                0,                  // No feature dim
-                d_bin_offsets,      // Bin offsets
-                d_block_info,       // Block info
-                m_config);
-        }
-        else
-        {
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-            vanilla_backward_kernel<DIM, ComputationType::Density, 1><<<grid_dim, block_dim>>>(
-                d_binned_positions, // Input binned positions
-                nullptr,            // No input density
-                d_mass,             // Input mass
-                nullptr,            // No input state
-                dL_rho_out.data(),  // Gradient of output density
-                nullptr,            // No gradient of output count
-                nullptr,            // No gradient of output blur state
-                nullptr,            // No gradient of state gradient
-                nullptr,            // No gradient of density gradient
-                nullptr,            // No gradient of moment matrix
-                d_grad_x,           // Gradient w.r.t. position
-                nullptr,            // No backward w.r.t. rho
-                nullptr,            // No backward w.r.t. state
-                0,                  // No feature dim
-                d_bin_offsets,      // Bin offsets
-                m_config);
-        }
+            return;
+        OperatorArgs args = operator_args(binned_positions, bin_offsets, block_info);
+        validate_array_shape(mass, per_particle(), "mass");
+        validate_array_shape(dL_rho_out, per_particle(), "grad_output_rho");
+        validate_array_shape(grad_x, per_particle({m_dimension}), "grad_x");
+        args.mass = mass.data();
+        args.dL_rho = dL_rho_out.data();
+        args.grad_positions = reinterpret_cast<ParticlePosition<DIM> *>(grad_x.data());
+        launch_backward<ComputationType::Density, 128, 128>(args, 128 * (1 + 1 + 2 + DIM));
     }
 
-    void blur_backward(
-        FloatArray3D binned_positions,  // Shape (batch_size, N, DIM)
-        FloatArray2D rho,               // Input density, Shape (batch_size, N)
-        FloatArray2D mass,              // Input mass, Shape (batch_size, N)
-        FloatArray3D state_in,          // Input state, Shape (batch_size, N, feature_dim)
-        FloatArray3D dL_blur_state_out, // Gradient of output state, Shape (batch_size, N, feature_dim)
-        FloatArray3D grad_x,            // Backward gradient w.r.t to position Shape (batch_size, N, DIM)
-        FloatArray3D grad_s,            // Backward gradient w.r.t to input state Shape (batch_size, N, feature_dim)
-        FloatArray2D grad_rho,          // Backward gradient w.r.t to input density Shape (batch_size, N)
-        IntArray1D bin_offsets,         // Shape (batch_size * cell_count + 1)
-        BlockInfoArray block_info,      // Shape (max_blocks, 4)
-        bool dLdx = true,               // Whether to compute gradient w.r.t. position
-        bool dLds = true,               // Whether to compute gradient w.r.t. input state
-        bool dLdrho = true              // Whether to compute gradient w.r.t. input density
-    )
+    void blur_backward(FloatArray3D binned_positions, FloatArray2D rho, FloatArray2D mass, FloatArray3D state_in,
+                       FloatArray3D dL_blur_state_out, FloatArray3D grad_x, FloatArray3D grad_s, FloatArray2D grad_rho,
+                       IntArray1D bin_offsets, BlockInfoArray block_info,
+                       bool dLdx = true, bool dLds = true, bool dLdrho = true)
     {
-
         if (!dLdx && !dLds && !dLdrho)
-            return; // No gradient to compute
-
+            return;
         uint32_t feature_dim = state_in.shape(2);
-        validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-        validate_array_shape(mass, {m_config.batch_size, m_config.particle_count}, "mass");
-        validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(rho, {m_config.batch_size, m_config.particle_count}, "rho");
-        validate_array_shape(state_in, {m_config.batch_size, m_config.particle_count, feature_dim}, "state_in");
-        validate_array_shape(dL_blur_state_out, {m_config.batch_size, m_config.particle_count, feature_dim}, "dL_blur_state_out");
+        OperatorArgs args = operator_args(binned_positions, bin_offsets, block_info);
+        validate_array_shape(mass, per_particle(), "mass");
+        validate_array_shape(rho, per_particle(), "rho");
+        validate_array_shape(state_in, per_particle({feature_dim}), "state_in");
+        validate_array_shape(dL_blur_state_out, per_particle({feature_dim}), "dL_blur_state_out");
         if (dLdx)
-            validate_array_shape(grad_x, {m_config.batch_size, m_config.particle_count, m_dimension}, "grad_x");
+            validate_array_shape(grad_x, per_particle({m_dimension}), "grad_x");
         if (dLds)
-            validate_array_shape(grad_s, {m_config.batch_size, m_config.particle_count, feature_dim}, "grad_s");
+            validate_array_shape(grad_s, per_particle({feature_dim}), "grad_s");
         if (dLdrho)
-            validate_array_shape(grad_rho, {m_config.batch_size, m_config.particle_count}, "grad_rho");
-        if constexpr (ST == KernelStrategy::GridBased)
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
-
-        // Cast device pointers
-        const ParticlePosition<DIM> *d_binned_positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
-        const uint32_t *d_bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
-        const float *d_mass = mass.data();
-        ParticlePosition<DIM> *d_grad_x;
-        d_grad_x = reinterpret_cast<ParticlePosition<DIM> *>(grad_x.data());
-        float *d_grad_rho = reinterpret_cast<float *>(grad_rho.data());
-        float *d_grad_s = reinterpret_cast<float *>(grad_s.data());
-        bool DS_ONLY = dLds && !dLdx && !dLdrho;
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            BlockInfo *d_block_info = reinterpret_cast<BlockInfo *>(block_info.data());
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim(m_max_blocks, 1, 1);
-            const int STRIDE = 64;
-            // Lambda to launch kernel with appropriate template parameter
-            auto launch_kernel = [&](auto ds_only_flag)
-            {
-                size_t smem_size;
-
-                if constexpr (ds_only_flag)
-                    smem_size = STRIDE * (feature_dim * 2 + 2) * sizeof(float);
-                else
-                    smem_size = STRIDE * (feature_dim * 5 + DIM + 5) * sizeof(float);
-
-                backward_kernel<DIM, ComputationType::Blur, STRIDE, BC, ST, ds_only_flag><<<grid_dim, block_dim, smem_size>>>(
-                    d_binned_positions,       // Input binned positions
-                    rho.data(),               // Input density
-                    d_mass,                   // Input mass
-                    state_in.data(),          // Input state
-                    nullptr,                  // Gradient of output density
-                    nullptr,                  // No gradient of output count
-                    dL_blur_state_out.data(), // Gradient of output blur state
-                    nullptr,                  // No gradient of state gradient
-                    nullptr,                  // No gradient of density gradient
-                    nullptr,                  // No gradient of moment matrix
-                    d_grad_x,                 // Gradient w.r.t. position
-                    d_grad_rho,               // Gradient w.r.t. rho
-                    d_grad_s,                 // Gradient w.r.t. state
-                    feature_dim,              // Feature dim
-                    d_bin_offsets,            // Bin offsets
-                    d_block_info,             // Block info
-                    m_config);
-            };
-
-            // Launch with appropriate template parameter
-            if (DS_ONLY)
-                launch_kernel(std::true_type{});
-            else
-                launch_kernel(std::false_type{});
-        }
+            validate_array_shape(grad_rho, per_particle(), "grad_rho");
+        args.rho = rho.data();
+        args.mass = mass.data();
+        args.state = state_in.data();
+        args.dL_blur = dL_blur_state_out.data();
+        args.grad_positions = reinterpret_cast<ParticlePosition<DIM> *>(grad_x.data());
+        args.grad_rho = grad_rho.data();
+        args.grad_state = grad_s.data();
+        args.feature_dim = feature_dim;
+        if (dLds && !dLdx && !dLdrho)
+            launch_backward<ComputationType::Blur, 64, 256, true>(args, 64 * (feature_dim * 2 + 2));
         else
-        {
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-
-            auto launch_blur_backward_kernel = [&](auto ds_only_flag, auto max_features)
-            {
-                vanilla_backward_kernel<DIM, ComputationType::Blur, max_features, BC, ST, ds_only_flag><<<grid_dim, block_dim>>>(
-                    d_binned_positions,       // Input binned positions
-                    rho.data(),               // Input density
-                    d_mass,                   // Input mass
-                    state_in.data(),          // Input state
-                    nullptr,                  // Gradient of output density
-                    nullptr,                  // No gradient of output count
-                    dL_blur_state_out.data(), // Gradient of output blur state
-                    nullptr,                  // No gradient of state gradient
-                    nullptr,                  // No gradient of density gradient
-                    nullptr,                  // No gradient of moment matrix
-                    d_grad_x,                 // Gradient w.r.t. position
-                    d_grad_rho,               // Gradient w.r.t. rho
-                    d_grad_s,                 // Gradient w.r.t. state
-                    feature_dim,              // Feature dim
-                    d_bin_offsets,            // Bin offsets
-                    m_config);
-            };
-
-            // Launch with appropriate template parameter
-            if (DS_ONLY)
-            {
-                if (feature_dim <= 8)
-                    launch_blur_backward_kernel(std::true_type{}, std::integral_constant<int, 8>{});
-                else if (feature_dim <= 16)
-                    launch_blur_backward_kernel(std::true_type{}, std::integral_constant<int, 16>{});
-                else if (feature_dim <= 32)
-                    launch_blur_backward_kernel(std::true_type{}, std::integral_constant<int, 32>{});
-                else if (feature_dim <= 48)
-                    launch_blur_backward_kernel(std::true_type{}, std::integral_constant<int, 48>{});
-                else if (feature_dim <= 64)
-                    launch_blur_backward_kernel(std::true_type{}, std::integral_constant<int, 64>{});
-                else
-                    throw std::runtime_error("feature_dim exceeds maximum supported value of 32.");
-            }
-            else
-            {
-                if (feature_dim <= 8)
-                    launch_blur_backward_kernel(std::false_type{}, std::integral_constant<int, 8>{});
-                else if (feature_dim <= 16)
-                    launch_blur_backward_kernel(std::false_type{}, std::integral_constant<int, 16>{});
-                else if (feature_dim <= 32)
-                    launch_blur_backward_kernel(std::false_type{}, std::integral_constant<int, 32>{});
-                else if (feature_dim <= 48)
-                    launch_blur_backward_kernel(std::false_type{}, std::integral_constant<int, 48>{});
-                else if (feature_dim <= 64)
-                    launch_blur_backward_kernel(std::false_type{}, std::integral_constant<int, 64>{});
-                else
-                    throw std::runtime_error("feature_dim exceeds maximum supported value of 32.");
-            }
-        }
+            launch_backward<ComputationType::Blur, 64, 256>(args, 64 * (feature_dim * 5 + DIM + 5));
     }
 
-    void density_gradient_backward(
-        FloatArray3D binned_positions,        // Shape (batch_size, N, DIM)
-        FloatArray2D mass,                    // Input mass, Shape (batch_size, N)
-        FloatArray3D dL_density_gradient_out, // Gradient of output density gradient, Shape (batch_size, N, DIM)
-        FloatArray3D grad_x,                  // Backward gradient w.r.t to position Shape (batch_size, N, DIM)
-        IntArray1D bin_offsets,               // Shape (batch_size * cell_count + 1)
-        BlockInfoArray block_info,            // Shape (max_blocks, 4)
-        bool dLdx = true                      // Whether to compute gradient w.r.t. position
-    )
+    void density_gradient_backward(FloatArray3D binned_positions, FloatArray2D mass, FloatArray3D dL_density_gradient_out,
+                                   FloatArray3D grad_x, IntArray1D bin_offsets, BlockInfoArray block_info, bool dLdx = true)
     {
         if (!dLdx)
-            return; // No gradient to compute
-
-        validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-        validate_array_shape(mass, {m_config.batch_size, m_config.particle_count}, "mass");
-        validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(dL_density_gradient_out, {m_config.batch_size, m_config.particle_count, DIM}, "dL_density_gradient_out");
-        validate_array_shape(grad_x, {m_config.batch_size, m_config.particle_count, m_dimension}, "grad_x");
-        if constexpr (ST == KernelStrategy::GridBased)
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
-
-        // Cast device pointers
-        const ParticlePosition<DIM> *d_binned_positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
-        const uint32_t *d_bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
-        const float *d_mass = mass.data();
-        ParticlePosition<DIM> *d_grad_x;
-        d_grad_x = reinterpret_cast<ParticlePosition<DIM> *>(grad_x.data());
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            BlockInfo *d_block_info = reinterpret_cast<BlockInfo *>(block_info.data());
-            dim3 block_dim(128, 1, 1);
-            dim3 grid_dim(m_max_blocks, 1, 1);
-            const int STRIDE = 128;
-            size_t smem_size = STRIDE * (DIM + DIM + DIM + 2) * sizeof(float); // local_mass and neighbor_mass
-            backward_kernel<DIM, ComputationType::DensityGradient, STRIDE><<<grid_dim, block_dim, smem_size>>>(
-                d_binned_positions,             // Input binned positions
-                nullptr,                        // No input density
-                d_mass,                         // Input mass
-                nullptr,                        // No input state
-                nullptr,                        // Gradient of output density
-                nullptr,                        // No gradient of output count
-                nullptr,                        // No gradient of output blur state
-                nullptr,                        // No gradient of state gradient
-                dL_density_gradient_out.data(), // No gradient of density gradient
-                nullptr,                        // No gradient of moment matrix
-                d_grad_x,                       // Gradient w.r.t. position
-                nullptr,                        // No backward w.r.t. rho
-                nullptr,                        // No backward w.r.t. state
-                0,                              // No feature dim
-                d_bin_offsets,                  // Bin offsets
-                d_block_info,                   // Block info
-                m_config);
-        }
-        else
-        {
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-            vanilla_backward_kernel<DIM, ComputationType::DensityGradient, 1><<<grid_dim, block_dim>>>(
-                d_binned_positions,             // Input binned positions
-                nullptr,                        // No input density
-                d_mass,                         // Input mass
-                nullptr,                        // No input state
-                nullptr,                        // Gradient of output density
-                nullptr,                        // No gradient of output count
-                nullptr,                        // No gradient of output blur state
-                nullptr,                        // No gradient of state gradient
-                dL_density_gradient_out.data(), // No gradient of density gradient
-                nullptr,                        // No gradient of moment matrix
-                d_grad_x,                       // Gradient w.r.t. position
-                nullptr,                        // No backward w.r.t. rho
-                nullptr,                        // No backward w.r.t. state
-                0,                              // No feature dim
-                d_bin_offsets,                  // Bin offsets
-                m_config);
-        }
+            return;
+        OperatorArgs args = operator_args(binned_positions, bin_offsets, block_info);
+        validate_array_shape(mass, per_particle(), "mass");
+        validate_array_shape(dL_density_gradient_out, per_particle({DIM}), "dL_density_gradient_out");
+        validate_array_shape(grad_x, per_particle({m_dimension}), "grad_x");
+        args.mass = mass.data();
+        args.dL_density_gradient = dL_density_gradient_out.data();
+        args.grad_positions = reinterpret_cast<ParticlePosition<DIM> *>(grad_x.data());
+        launch_backward<ComputationType::DensityGradient, 128, 128>(args, 128 * (DIM + DIM + DIM + 2));
     }
 
-    void gradient_backward(
-        FloatArray3D binned_positions,  // Shape (batch_size, N, DIM)
-        FloatArray2D rho,               // Input density, Shape (batch_size, N)
-        FloatArray2D mass,              // Input mass, Shape (batch_size, N)
-        FloatArray3D state_in,          // Input state, Shape (batch_size, N, feature_dim)
-        FloatArray4D dL_grad_state_out, // Gradient of output state, Shape (batch_size, N, feature_dim, DIM)
-        FloatArray3D grad_x,            // Backward gradient w.r.t to position Shape (batch_size, N, DIM)
-        FloatArray3D grad_s,            // Backward gradient w.r.t to input state Shape (batch_size, N, feature_dim)
-        FloatArray2D grad_rho,          // Backward gradient w.r.t to input density Shape (batch_size, N)
-        IntArray1D bin_offsets,         // Shape (batch_size * cell_count + 1)
-        BlockInfoArray block_info,      // Shape (max_blocks, 4)
-        bool dLdx = true,               // Whether to compute gradient w.r.t. position
-        bool dLds = true,               // Whether to compute gradient w.r.t. input state
-        bool dLdrho = true              // Whether to compute gradient w.r.t. input density
-    )
+    void gradient_backward(FloatArray3D binned_positions, FloatArray2D rho, FloatArray2D mass, FloatArray3D state_in,
+                           FloatArray4D dL_grad_state_out, FloatArray3D grad_x, FloatArray3D grad_s, FloatArray2D grad_rho,
+                           IntArray1D bin_offsets, BlockInfoArray block_info,
+                           bool dLdx = true, bool dLds = true, bool dLdrho = true)
     {
         if (!dLdx && !dLds && !dLdrho)
-            return; // No gradient to compute
-
-        validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-        validate_array_shape(mass, {m_config.batch_size, m_config.particle_count}, "mass");
-        validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(rho, {m_config.batch_size, m_config.particle_count}, "rho");
+            return;
         uint32_t feature_dim = state_in.shape(2);
-        validate_array_shape(state_in, {m_config.batch_size, m_config.particle_count, feature_dim}, "state_in");
-        validate_array_shape(dL_grad_state_out, {m_config.batch_size, m_config.particle_count, feature_dim, DIM}, "dL_grad_state_out");
+        OperatorArgs args = operator_args(binned_positions, bin_offsets, block_info);
+        validate_array_shape(mass, per_particle(), "mass");
+        validate_array_shape(rho, per_particle(), "rho");
+        validate_array_shape(state_in, per_particle({feature_dim}), "state_in");
+        validate_array_shape(dL_grad_state_out, per_particle({feature_dim, DIM}), "dL_grad_state_out");
         if (dLdx)
-            validate_array_shape(grad_x, {m_config.batch_size, m_config.particle_count, m_dimension}, "grad_x");
+            validate_array_shape(grad_x, per_particle({m_dimension}), "grad_x");
         if (dLds)
-            validate_array_shape(grad_s, {m_config.batch_size, m_config.particle_count, feature_dim}, "grad_s");
+            validate_array_shape(grad_s, per_particle({feature_dim}), "grad_s");
         if (dLdrho)
-            validate_array_shape(grad_rho, {m_config.batch_size, m_config.particle_count}, "grad_rho");
-
-        if constexpr (ST == KernelStrategy::GridBased)
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
-
-        // Cast device pointers
-        const ParticlePosition<DIM> *d_binned_positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
-        const uint32_t *d_bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
-        const float *d_mass = mass.data();
-        ParticlePosition<DIM> *d_grad_x;
-        d_grad_x = reinterpret_cast<ParticlePosition<DIM> *>(grad_x.data());
-        float *d_grad_rho = reinterpret_cast<float *>(grad_rho.data());
-        float *d_grad_s = reinterpret_cast<float *>(grad_s.data());
-        bool DS_ONLY = dLds && !dLdx && !dLdrho;
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            BlockInfo *d_block_info = reinterpret_cast<BlockInfo *>(block_info.data());
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim(m_max_blocks, 1, 1);
-            const int STRIDE = 32;
-            auto launch_kernel = [&](auto ds_only_flag)
-            {
-                size_t smem_size;
-                if constexpr (ds_only_flag)
-                    // Optimized memory layout for DS_ONLY case
-                    smem_size = STRIDE * (feature_dim * (2 * DIM + 1) + 4) * sizeof(float);
-                else
-                    // Full memory layout for all gradients
-                    smem_size = STRIDE * (feature_dim * (3 + 2 * DIM) + DIM + 5) * sizeof(float);
-
-                backward_kernel<DIM, ComputationType::Gradient, STRIDE, BC, ST, ds_only_flag><<<grid_dim, block_dim, smem_size>>>(
-                    d_binned_positions,       // Input binned positions
-                    rho.data(),               // Input density
-                    d_mass,                   // Input mass
-                    state_in.data(),          // Input state
-                    nullptr,                  // Gradient of output density
-                    nullptr,                  // No gradient of output count
-                    nullptr,                  // No gradient of output blur state
-                    dL_grad_state_out.data(), // Gradient of state gradient
-                    nullptr,                  // No gradient of density gradient
-                    nullptr,                  // No gradient of moment matrix
-                    d_grad_x,                 // Gradient w.r.t. position
-                    d_grad_rho,               // Gradient w.r.t. rho
-                    d_grad_s,                 // Gradient w.r.t. state
-                    feature_dim,              // Feature dim
-                    d_bin_offsets,            // Bin offsets
-                    d_block_info,             // Block info
-                    m_config);
-            };
-
-            // Launch with appropriate template parameter
-            if (DS_ONLY)
-                launch_kernel(std::true_type{});
-            else
-                launch_kernel(std::false_type{});
-        }
+            validate_array_shape(grad_rho, per_particle(), "grad_rho");
+        args.rho = rho.data();
+        args.mass = mass.data();
+        args.state = state_in.data();
+        args.dL_gradient = dL_grad_state_out.data();
+        args.grad_positions = reinterpret_cast<ParticlePosition<DIM> *>(grad_x.data());
+        args.grad_rho = grad_rho.data();
+        args.grad_state = grad_s.data();
+        args.feature_dim = feature_dim;
+        if (dLds && !dLdx && !dLdrho)
+            launch_backward<ComputationType::Gradient, 32, 256, true>(args, 32 * (feature_dim * (2 * DIM + 1) + 4));
         else
-        {
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-
-            auto launch_gradient_backward_kernel = [&](auto ds_only_flag, auto max_features)
-            {
-                vanilla_backward_kernel<DIM, ComputationType::Gradient, max_features, BC, ST, ds_only_flag><<<grid_dim, block_dim>>>(
-                    d_binned_positions,       // Input binned positions
-                    rho.data(),               // Input density
-                    d_mass,                   // Input mass
-                    state_in.data(),          // Input state
-                    nullptr,                  // Gradient of output density
-                    nullptr,                  // No gradient of output count
-                    nullptr,                  // No gradient of output blur state
-                    dL_grad_state_out.data(), // Gradient of state gradient
-                    nullptr,                  // No gradient of density gradient
-                    nullptr,                  // No gradient of moment matrix
-                    d_grad_x,                 // Gradient w.r.t. position
-                    d_grad_rho,               // Gradient w.r.t. rho
-                    d_grad_s,                 // Gradient w.r.t. state
-                    feature_dim,              // Feature dim
-                    d_bin_offsets,            // Bin offsets
-                    m_config);
-            };
-
-            // Launch with appropriate template parameter
-            if (DS_ONLY)
-            {
-                if (feature_dim <= 8)
-                    launch_gradient_backward_kernel(std::true_type{}, std::integral_constant<int, 8>{});
-                else if (feature_dim <= 16)
-                    launch_gradient_backward_kernel(std::true_type{}, std::integral_constant<int, 16>{});
-                else if (feature_dim <= 32)
-                    launch_gradient_backward_kernel(std::true_type{}, std::integral_constant<int, 32>{});
-                else if (feature_dim <= 48)
-                    launch_gradient_backward_kernel(std::true_type{}, std::integral_constant<int, 48>{});
-                else if (feature_dim <= 64)
-                    launch_gradient_backward_kernel(std::true_type{}, std::integral_constant<int, 64>{});
-                else
-                    throw std::runtime_error("feature_dim exceeds maximum supported value of 32.");
-            }
-            else
-            {
-                if (feature_dim <= 8)
-                    launch_gradient_backward_kernel(std::false_type{}, std::integral_constant<int, 8>{});
-                else if (feature_dim <= 16)
-                    launch_gradient_backward_kernel(std::false_type{}, std::integral_constant<int, 16>{});
-                else if (feature_dim <= 32)
-                    launch_gradient_backward_kernel(std::false_type{}, std::integral_constant<int, 32>{});
-                else if (feature_dim <= 48)
-                    launch_gradient_backward_kernel(std::false_type{}, std::integral_constant<int, 48>{});
-                else if (feature_dim <= 64)
-                    launch_gradient_backward_kernel(std::false_type{}, std::integral_constant<int, 64>{});
-                else
-                    throw std::runtime_error("feature_dim exceeds maximum supported value of 32.");
-            }
-        }
+            launch_backward<ComputationType::Gradient, 32, 256>(args, 32 * (feature_dim * (3 + 2 * DIM) + DIM + 5));
     }
 
-    void moment_matrix_backward(
-        FloatArray3D binned_positions,     // Shape (batch_size, N, DIM)
-        FloatArray2D rho,                  // Input density, Shape (batch_size, N)
-        FloatArray2D mass,                 // Input mass, Shape (batch_size, N)
-        FloatArray4D dL_moment_matrix_out, // Gradient of output moment matrix, Shape (batch_size, N, DIM, DIM)
-        FloatArray3D grad_x,               // Backward gradient w.r.t to position Shape (batch_size, N, DIM)
-        FloatArray2D grad_rho,             // Backward gradient w.r.t to input density Shape (batch_size, N)
-        IntArray1D bin_offsets,            // Shape (batch_size * cell_count + 1)
-        BlockInfoArray block_info,         // Shape (max_blocks, 4)
-        bool dLdx = true,                  // Whether to compute gradient w.r.t. position
-        bool dLdrho = true                 // Whether to compute gradient w.r.t. input density
-    )
+    void moment_matrix_backward(FloatArray3D binned_positions, FloatArray2D rho, FloatArray2D mass,
+                                FloatArray4D dL_moment_matrix_out, FloatArray3D grad_x, FloatArray2D grad_rho,
+                                IntArray1D bin_offsets, BlockInfoArray block_info, bool dLdx = true, bool dLdrho = true)
     {
         if (!dLdx && !dLdrho)
-            return; // No gradient to compute
-
-        validate_array_shape(binned_positions, {m_config.batch_size, m_config.particle_count, m_dimension}, "binned_positions");
-        validate_array_shape(mass, {m_config.batch_size, m_config.particle_count}, "mass");
-        validate_array_shape(bin_offsets, {m_config.batch_size * m_config.cell_count + 1}, "bin_offsets");
-        validate_array_shape(rho, {m_config.batch_size, m_config.particle_count}, "rho");
-        validate_array_shape(dL_moment_matrix_out, {m_config.batch_size, m_config.particle_count, DIM, DIM}, "dL_moment_matrix_out");
+            return;
+        OperatorArgs args = operator_args(binned_positions, bin_offsets, block_info);
+        validate_array_shape(mass, per_particle(), "mass");
+        validate_array_shape(rho, per_particle(), "rho");
+        validate_array_shape(dL_moment_matrix_out, per_particle({DIM, DIM}), "dL_moment_matrix_out");
         if (dLdx)
-            validate_array_shape(grad_x, {m_config.batch_size, m_config.particle_count, m_dimension}, "grad_x");
+            validate_array_shape(grad_x, per_particle({m_dimension}), "grad_x");
         if (dLdrho)
-            validate_array_shape(grad_rho, {m_config.batch_size, m_config.particle_count}, "grad_rho");
-        if constexpr (ST == KernelStrategy::GridBased)
-            validate_array_shape(block_info, {m_max_blocks, 4}, "block_info");
-
-        // Cast device pointers
-        const ParticlePosition<DIM> *d_binned_positions = reinterpret_cast<const ParticlePosition<DIM> *>(binned_positions.data());
-        const uint32_t *d_bin_offsets = reinterpret_cast<const uint32_t *>(bin_offsets.data());
-        const float *d_mass = mass.data();
-        ParticlePosition<DIM> *d_grad_x;
-        d_grad_x = reinterpret_cast<ParticlePosition<DIM> *>(grad_x.data());
-        float *d_grad_rho = reinterpret_cast<float *>(grad_rho.data());
-
-        if constexpr (ST == KernelStrategy::GridBased)
-        {
-            BlockInfo *d_block_info = reinterpret_cast<BlockInfo *>(block_info.data());
-            dim3 block_dim(128, 1, 1);
-            dim3 grid_dim(m_max_blocks, 1, 1);
-            const int STRIDE = 128;
-            size_t smem_size = STRIDE * (DIM * DIM * 2 + 2 + DIM + 3) * sizeof(float);
-            backward_kernel<DIM, ComputationType::MomentMatrix, STRIDE><<<grid_dim, block_dim, smem_size>>>(
-                d_binned_positions,          // Input binned positions
-                rho.data(),                  // No input density
-                d_mass,                      // Input mass
-                nullptr,                     // No input state
-                nullptr,                     // Gradient of output density
-                nullptr,                     // No gradient of output count
-                nullptr,                     // No gradient of output blur state
-                nullptr,                     // No gradient of state gradient
-                nullptr,                     // No gradient of density gradient
-                dL_moment_matrix_out.data(), // No gradient of moment matrix
-                d_grad_x,                    // Gradient w.r.t. position
-                d_grad_rho,                  // Gradient w.r.t. rho
-                nullptr,                     // No backward w.r.t. state
-                0,                           // No feature dim
-                d_bin_offsets,               // Bin offsets
-                d_block_info,                // Block info
-                m_config);
-        }
-        else
-        {
-            dim3 block_dim(256, 1, 1);
-            dim3 grid_dim((m_config.particle_count + block_dim.x - 1) / block_dim.x, m_config.batch_size, 1);
-            vanilla_backward_kernel<DIM, ComputationType::MomentMatrix, 1><<<grid_dim, block_dim>>>(
-                d_binned_positions,          // Input binned positions
-                rho.data(),                  // No input density
-                d_mass,                      // Input mass
-                nullptr,                     // No input state
-                nullptr,                     // Gradient of output density
-                nullptr,                     // No gradient of output count
-                nullptr,                     // No gradient of output blur state
-                nullptr,                     // No gradient of state gradient
-                nullptr,                     // No gradient of density gradient
-                dL_moment_matrix_out.data(), // No gradient of moment matrix
-                d_grad_x,                    // Gradient w.r.t. position
-                d_grad_rho,                  // Gradient w.r.t. rho
-                nullptr,                     // No backward w.r.t. state
-                0,                           // No feature dim
-                d_bin_offsets,               // Bin offsets
-                m_config);
-        }
+            validate_array_shape(grad_rho, per_particle(), "grad_rho");
+        args.rho = rho.data();
+        args.mass = mass.data();
+        args.dL_moment_matrix = dL_moment_matrix_out.data();
+        args.grad_positions = reinterpret_cast<ParticlePosition<DIM> *>(grad_x.data());
+        args.grad_rho = grad_rho.data();
+        launch_backward<ComputationType::MomentMatrix, 128, 128>(args, 128 * (DIM * DIM * 2 + 2 + DIM + 3));
     }
 };
 
-template <BoundaryCondition BC, KernelStrategy ST>
-class HashGrid2D : public HashGrid<2, BC, ST>
+template <BoundaryCondition BC>
+class HashGrid2D : public HashGrid<2, BC>
 {
 public:
     HashGrid2D(int grid_size_x, int grid_size_y, float eps, uint32_t particle_count, uint32_t batch_size, uint32_t max_particles_per_block)
     {
-        this->m_config.grid_size[0] = grid_size_x;
-        this->m_config.grid_size[1] = grid_size_y;
-        this->m_config.cell_count = (uint32_t)(grid_size_x * grid_size_y);
-        this->m_config.is_pow2 = (grid_size_x & (grid_size_x - 1)) == 0 && (grid_size_y & (grid_size_y - 1)) == 0;
-
-        this->_init(eps, particle_count, batch_size, max_particles_per_block);
+        this->_init({grid_size_x, grid_size_y}, eps, particle_count, batch_size, max_particles_per_block);
     }
 };
 
-using HashGrid2DPeriodic = HashGrid2D<BoundaryCondition::PERIODIC, KernelStrategy::GridBased>;
-using HashGrid2DBox = HashGrid2D<BoundaryCondition::CLAMP, KernelStrategy::GridBased>;
+using HashGrid2DPeriodic = HashGrid2D<BoundaryCondition::PERIODIC>;
+using HashGrid2DBox = HashGrid2D<BoundaryCondition::CLAMP>;
 
-using VHashGrid2DPeriodic = HashGrid2D<BoundaryCondition::PERIODIC, KernelStrategy::ParticleBased>;
-using VHashGrid2DBox = HashGrid2D<BoundaryCondition::CLAMP, KernelStrategy::ParticleBased>;
-
-template <BoundaryCondition BC, KernelStrategy ST>
-class HashGrid3D : public HashGrid<3, BC, ST>
+template <BoundaryCondition BC>
+class HashGrid3D : public HashGrid<3, BC>
 {
 public:
     HashGrid3D(int grid_size_x, int grid_size_y, int grid_size_z, float eps, uint32_t particle_count, uint32_t batch_size, uint32_t max_particles_per_block)
     {
-        this->m_config.grid_size[0] = grid_size_x;
-        this->m_config.grid_size[1] = grid_size_y;
-        this->m_config.grid_size[2] = grid_size_z;
-        this->m_config.cell_count = (uint32_t)(grid_size_x * grid_size_y * grid_size_z);
-        this->m_config.is_pow2 = (grid_size_x & (grid_size_x - 1)) == 0 && (grid_size_y & (grid_size_y - 1)) == 0 &&
-                                 (grid_size_z & (grid_size_z - 1)) == 0;
-
-        this->_init(eps, particle_count, batch_size, max_particles_per_block);
+        this->_init({grid_size_x, grid_size_y, grid_size_z}, eps, particle_count, batch_size, max_particles_per_block);
     }
 
     int grid_size_z() const { return this->m_config.grid_size[2]; }
 };
 
-using HashGrid3DPeriodic = HashGrid3D<BoundaryCondition::PERIODIC, KernelStrategy::GridBased>;
-using HashGrid3DBox = HashGrid3D<BoundaryCondition::CLAMP, KernelStrategy::GridBased>;
+using HashGrid3DPeriodic = HashGrid3D<BoundaryCondition::PERIODIC>;
+using HashGrid3DBox = HashGrid3D<BoundaryCondition::CLAMP>;
 
-using VHashGrid3DPeriodic = HashGrid3D<BoundaryCondition::PERIODIC, KernelStrategy::ParticleBased>;
-using VHashGrid3DBox = HashGrid3D<BoundaryCondition::CLAMP, KernelStrategy::ParticleBased>;
-
-void __global__ safe_inv_2x2_sym_mat_kernel(
-    const float4 * __restrict__ in_matrix, // matrix of shape [B, N, 2, 2]
-    float4 * __restrict__ out_matrix,      // matrix of shape [B, N, 2, 2]
-    uint32_t batch_size,
-    uint32_t N,
-    uint32_t dim,
-    float tol = 1e-3f)
+// One thread per symmetric DIM x DIM matrix; see safe_inverse_symmetric.
+template <int DIM>
+__global__ void safe_inverse_kernel(const float *__restrict__ in_matrix, float *__restrict__ out_matrix,
+                                    uint32_t count, float tolerance)
 {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t total = batch_size * N;
-    if (idx >= total)
+    if (idx >= count)
         return;
-
-    float4 in_mat = in_matrix[idx];
-
-    float det = in_mat.x * in_mat.w - in_mat.y * in_mat.y; // ad - b^2
-    if (fabsf(det) < tol)
+    float matrix[DIM * DIM];
+    if constexpr (DIM == 2)
     {
-        // Set to identity if near-singular
-        out_matrix[idx] = make_float4(1.0f, 0.0f, 0.0f, 1.0f);
+        float4 m = reinterpret_cast<const float4 *>(in_matrix)[idx];
+        matrix[0] = m.x;
+        matrix[1] = m.y;
+        matrix[2] = m.z;
+        matrix[3] = m.w;
     }
     else
     {
-        float inv_det = 1.0f / det;
-        // Inverse of 2x2 matrix [a b; b d] is (1/det) * [d -b; -b a]
-        out_matrix[idx] = make_float4(in_mat.w * inv_det, -in_mat.y * inv_det,
-                                      -in_mat.y * inv_det, in_mat.x * inv_det);
+        for (int k = 0; k < DIM * DIM; ++k)
+            matrix[k] = in_matrix[idx * DIM * DIM + k];
     }
-}
-
-void __global__ safe_inv_3x3_sym_mat_kernel(
-    const float * __restrict__ in_matrix, // matrix of shape [B, N, 3, 3]
-    float * __restrict__ out_matrix,      // matrix of shape [B, N, 3, 3]
-    uint32_t batch_size,
-    uint32_t N,
-    uint32_t dim,
-    float tol = 1e-3f)
-{
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t total = batch_size * N;
-    if (idx >= total)
-        return;
-
-    // a b c
-    // b d e
-    // c e f
-    float a = in_matrix[idx * 9 + 0];
-    float b = in_matrix[idx * 9 + 1];
-    float c = in_matrix[idx * 9 + 2];
-    float d = in_matrix[idx * 9 + 4];
-    float e = in_matrix[idx * 9 + 5];
-    float f = in_matrix[idx * 9 + 8];
-    // Compute determinant
-    float t1 = d * f - e * e; // uses symmetry
-    float t2 = c * e - b * f;
-    float t3 = b * e - c * d;
-    float det = a * t1 + b * t2 + c * t3;
-    if (fabsf(det) < tol)
-    {
-        // Set to identity if near-singular
-        out_matrix[idx * 9 + 0] = 1.0f;
-        out_matrix[idx * 9 + 1] = 0.0f;
-        out_matrix[idx * 9 + 2] = 0.0f;
-        out_matrix[idx * 9 + 3] = 0.0f;
-        out_matrix[idx * 9 + 4] = 1.0f;
-        out_matrix[idx * 9 + 5] = 0.0f;
-        out_matrix[idx * 9 + 6] = 0.0f;
-        out_matrix[idx * 9 + 7] = 0.0f;
-        out_matrix[idx * 9 + 8] = 1.0f;
-    }
+    safe_inverse_symmetric<DIM>(matrix, tolerance);
+    if constexpr (DIM == 2)
+        reinterpret_cast<float4 *>(out_matrix)[idx] = make_float4(matrix[0], matrix[1], matrix[2], matrix[3]);
     else
     {
-        float inv_det = 1.0f / det;
-        // Compute inverse using formula for symmetric matrix
-        out_matrix[idx * 9 + 0] = t1 * inv_det;              // (d*f - e*e) / det
-        out_matrix[idx * 9 + 1] = t2 * inv_det;              // (c*e - b*f) / det
-        out_matrix[idx * 9 + 2] = t3 * inv_det;              // (b*e - c*d) / det
-        out_matrix[idx * 9 + 3] = t2 * inv_det;              // symmetry
-        out_matrix[idx * 9 + 4] = (a * f - c * c) * inv_det; // (a*f - c*c) / det
-        out_matrix[idx * 9 + 5] = (b * c - a * e) * inv_det; // (b*c - a*e) / det
-        out_matrix[idx * 9 + 6] = t3 * inv_det;              // symmetry
-        out_matrix[idx * 9 + 7] = (b * c - a * e) * inv_det; // symmetry
-        out_matrix[idx * 9 + 8] = (a * d - b * b) * inv_det; // (a*d - b*b) / det
+        for (int k = 0; k < DIM * DIM; ++k)
+            out_matrix[idx * DIM * DIM + k] = matrix[k];
     }
 }
+
 void safe_inv_sym_mat(
     FloatArray4D in_matrix,  // Shape (batch_size, N, dim, dim)
     FloatArray4D out_matrix, // Shape (batch_size, N, dim, dim)
@@ -3432,44 +2043,18 @@ void safe_inv_sym_mat(
     uint32_t batch_size = in_matrix.shape(0);
     uint32_t N = in_matrix.shape(1);
     uint32_t dim = in_matrix.shape(2);
-    // dim should be either 2 or 3
     if (dim != 2 && dim != 3)
-    {
         throw std::runtime_error("safe_inverse only supports 2x2 or 3x3 matrices.");
-    }
     validate_array_shape(in_matrix, {batch_size, N, dim, dim}, "in_matrix");
     validate_array_shape(out_matrix, {batch_size, N, dim, dim}, "out_matrix");
 
-    uint32_t total = batch_size * N;
-    dim3 block_dim(256, 1, 1);
-    dim3 grid_dim((total + block_dim.x - 1) / block_dim.x, 1, 1);
-
+    uint32_t count = batch_size * N;
+    unsigned int blocks = (count + 255) / 256;
     if (dim == 2)
-    {
-        const float4 *in_matrix_ptr = reinterpret_cast<const float4 *>(in_matrix.data());
-        float4 *out_matrix_ptr = reinterpret_cast<float4 *>(out_matrix.data());
-
-        safe_inv_2x2_sym_mat_kernel<<<grid_dim, block_dim>>>(
-            in_matrix_ptr,
-            out_matrix_ptr,
-            batch_size,
-            N,
-            2,
-            tol);
-    }
+        safe_inverse_kernel<2><<<blocks, 256>>>(in_matrix.data(), out_matrix.data(), count, tol);
     else
-    {
-        const float *in_matrix_ptr = reinterpret_cast<const float *>(in_matrix.data());
-        float *out_matrix_ptr = reinterpret_cast<float *>(out_matrix.data());
-
-        safe_inv_3x3_sym_mat_kernel<<<grid_dim, block_dim>>>(
-            in_matrix_ptr,
-            out_matrix_ptr,
-            batch_size,
-            N,
-            3,
-            tol);
-    }
+        safe_inverse_kernel<3><<<blocks, 256>>>(in_matrix.data(), out_matrix.data(), count, tol);
+    cuda_check(cudaGetLastError());
 }
 
 // Macro to add common properties and methods
@@ -3642,57 +2227,29 @@ NB_MODULE(sph_cuda, m)
     auto grid2d_periodic = nb::class_<HashGrid2DPeriodic>(m, "HashGrid2DPeriodic")
                                .def(nb::init<int, int, float, uint32_t, uint32_t, uint32_t>(),
                                     "grid_size_x"_a, "grid_size_y"_a, "eps"_a, "particle_count"_a, "batch_size"_a, "max_particles_per_block"_a = 64,
-                                    "Initialize a 2D hash grid with given resolution, cell size, particle count, and batch size. Grid sizes must be powers of two.");
+                                    "Initialize a 2D hash grid with given resolution, cell size, particle count, and batch size.");
     ADD_COMMON_GRID_BINDINGS(grid2d_periodic, HashGrid2DPeriodic, "(batch_size, N, 2)");
 
     auto grid2d_box = nb::class_<HashGrid2DBox>(m, "HashGrid2DBox")
                           .def(nb::init<int, int, float, uint32_t, uint32_t, uint32_t>(),
                                "grid_size_x"_a, "grid_size_y"_a, "eps"_a, "particle_count"_a, "batch_size"_a, "max_particles_per_block"_a = 64,
-                               "Initialize a 2D hash grid with given resolution, cell size, particle count, and batch size. Grid sizes must be powers of two.");
+                               "Initialize a 2D hash grid with given resolution, cell size, particle count, and batch size.");
     ADD_COMMON_GRID_BINDINGS(grid2d_box, HashGrid2DBox, "(batch_size, N, 2)");
-
-    // Vanilla 2D HashGrid
-    auto vgrid2d_periodic = nb::class_<VHashGrid2DPeriodic>(m, "VHashGrid2DPeriodic")
-                                .def(nb::init<int, int, float, uint32_t, uint32_t, uint32_t>(),
-                                     "grid_size_x"_a, "grid_size_y"_a, "eps"_a, "particle_count"_a, "batch_size"_a, "max_particles_per_block"_a = 64,
-                                     "Initialize a vanilla 2D hash grid with given resolution, cell size, particle count, and batch size. Grid sizes must be powers of two.");
-    ADD_COMMON_GRID_BINDINGS(vgrid2d_periodic, VHashGrid2DPeriodic, "(batch_size, N, 2)");
-
-    auto vgrid2d_box = nb::class_<VHashGrid2DBox>(m, "VHashGrid2DBox")
-                           .def(nb::init<int, int, float, uint32_t, uint32_t, uint32_t>(),
-                                "grid_size_x"_a, "grid_size_y"_a, "eps"_a, "particle_count"_a, "batch_size"_a, "max_particles_per_block"_a = 64,
-                                "Initialize a vanilla 2D hash grid with given resolution, cell size, particle count, and batch size. Grid sizes must be powers of two.");
-    ADD_COMMON_GRID_BINDINGS(vgrid2d_box, VHashGrid2DBox, "(batch_size, N, 2)");
 
     // 3D HashGrid
     auto grid3d_periodic = nb::class_<HashGrid3DPeriodic>(m, "HashGrid3DPeriodic")
                                .def(nb::init<int, int, int, float, uint32_t, uint32_t, uint32_t>(),
                                     "grid_size_x"_a, "grid_size_y"_a, "grid_size_z"_a, "eps"_a, "particle_count"_a, "batch_size"_a, "max_particles_per_block"_a = 64,
-                                    "Initialize a 3D hash grid with given resolution, cell size, particle count, and batch size. Grid sizes must be powers of two.")
+                                    "Initialize a 3D hash grid with given resolution, cell size, particle count, and batch size.")
                                .def_prop_ro("grid_size_z", &HashGrid3DPeriodic::grid_size_z, "Grid size in z dimension");
-    ADD_COMMON_GRID_BINDINGS(grid3d_periodic, HashGrid3DPeriodic, "(batch_size, N, 4)");
+    ADD_COMMON_GRID_BINDINGS(grid3d_periodic, HashGrid3DPeriodic, "(batch_size, N, 3)");
 
     auto grid3d_box = nb::class_<HashGrid3DBox>(m, "HashGrid3DBox")
                           .def(nb::init<int, int, int, float, uint32_t, uint32_t, uint32_t>(),
                                "grid_size_x"_a, "grid_size_y"_a, "grid_size_z"_a, "eps"_a, "particle_count"_a, "batch_size"_a, "max_particles_per_block"_a = 64,
-                               "Initialize a 3D hash grid with given resolution, cell size, particle count, and batch size. Grid sizes must be powers of two.")
+                               "Initialize a 3D hash grid with given resolution, cell size, particle count, and batch size.")
                           .def_prop_ro("grid_size_z", &HashGrid3DBox::grid_size_z, "Grid size in z dimension");
-    ADD_COMMON_GRID_BINDINGS(grid3d_box, HashGrid3DBox, "(batch_size, N, 4)");
-
-    // Vanilla 3D HashGrid
-    auto vgrid3d_periodic = nb::class_<VHashGrid3DPeriodic>(m, "VHashGrid3DPeriodic")
-                                .def(nb::init<int, int, int, float, uint32_t, uint32_t, uint32_t>(),
-                                     "grid_size_x"_a, "grid_size_y"_a, "grid_size_z"_a, "eps"_a, "particle_count"_a, "batch_size"_a, "max_particles_per_block"_a = 64,
-                                     "Initialize a vanilla 3D hash grid with given resolution, cell size, particle count, and batch size. Grid sizes must be powers of two.")
-                                .def_prop_ro("grid_size_z", &VHashGrid3DPeriodic::grid_size_z, "Grid size in z dimension");
-    ADD_COMMON_GRID_BINDINGS(vgrid3d_periodic, VHashGrid3DPeriodic, "(batch_size, N, 4)");
-
-    auto vgrid3d_box = nb::class_<VHashGrid3DBox>(m, "VHashGrid3DBox")
-                           .def(nb::init<int, int, int, float, uint32_t, uint32_t, uint32_t>(),
-                                "grid_size_x"_a, "grid_size_y"_a, "grid_size_z"_a, "eps"_a, "particle_count"_a, "batch_size"_a, "max_particles_per_block"_a = 64,
-                                "Initialize a vanilla 3D hash grid with given resolution, cell size, particle count, and batch size. Grid sizes must be powers of two.")
-                           .def_prop_ro("grid_size_z", &VHashGrid3DBox::grid_size_z, "Grid size in z dimension");
-    ADD_COMMON_GRID_BINDINGS(vgrid3d_box, VHashGrid3DBox, "(batch_size, N, 4)");
+    ADD_COMMON_GRID_BINDINGS(grid3d_box, HashGrid3DBox, "(batch_size, N, 3)");
 
     m.def("safe_inv_sym_mat", &safe_inv_sym_mat, "in_matrix"_a, "out_matrix"_a, "tol"_a,
           "Compute the safe inverse of a batch of 2x2 or 3x3 symmetric matrices."

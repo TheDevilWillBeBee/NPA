@@ -148,8 +148,6 @@ class NPA(torch.nn.Module):
         dx_norm = dx_bin.norm(dim=-1).mean() if intermediate else None
         if update_prob < 1.0:
             update_mask = (update_mask < update_prob).float()
-        if dx_bin.shape[-1] != x_bin.shape[-1]:
-            dx_bin = torch.nn.functional.pad(dx_bin, (0, x_bin.shape[-1] - dx_bin.shape[-1]))
         x = x_bin + dt * dx_bin * update_mask
         s = s_bin + dt * ds_bin * update_mask
         if noise is not None:
@@ -217,12 +215,6 @@ def step_euler(
     if update_prob < 1.0:
         update_mask = (torch.rand(B, N, 1, device=x.device) < update_prob).float()
 
-    if dx_bin.shape[-1] != x.shape[-1]:
-        # For particles in 3D we actually pad them to 4D for better memory alignment
-        dx_bin = torch.cat(
-            [dx_bin, torch.zeros(B, N, 1, device=x.device)], dim=-1
-        ).contiguous()
-
     x = x_bin + dt * dx_bin * update_mask
     s = s_bin + dt * ds_bin * update_mask
     if noise_std > 0:
@@ -249,12 +241,6 @@ def step_euler_trace(
     update_mask = 1.0
     if update_prob < 1.0:
         update_mask = (torch.rand(B, N, 1, device=x.device) < update_prob).float()
-
-    if dx_bin.shape[-1] != x.shape[-1]:
-        # For particles in 3D we actually pad them to 4D for better memory alignment
-        dx_bin = torch.cat(
-            [dx_bin, torch.zeros(B, N, 1, device=x.device)], dim=-1
-        ).contiguous()
 
     x = x_bin + dt * dx_bin * update_mask
     s = s_bin + dt * ds_bin * update_mask
@@ -331,7 +317,7 @@ class Pool:
             raise ValueError(f"Unknown seed mode: {seed_mode}")
 
     def gaussian_seed(self, N):
-        d = 2 if self.spatial_dims == 2 else 4
+        d = self.spatial_dims
         x = torch.randn(N, self.num_particles, d, device=self.device) * self.sigma
         s = (
             torch.rand(N, self.num_particles, self.state_dims, device=self.device) - 0.5
@@ -339,7 +325,7 @@ class Pool:
         return x, s
 
     def uniform_seed(self, N):
-        d = 2 if self.spatial_dims == 2 else 4
+        d = self.spatial_dims
         x = torch.rand(N, self.num_particles, d, device=self.device)
         x = (x - 0.5) * self.sigma * 2.0
         s = (
@@ -366,7 +352,7 @@ class Pool:
             ) * self.noise_level
             return x, s
         elif self.spatial_dims == 3:
-            d = 4
+            d = 3
             theta = (
                 torch.rand(N, self.num_particles, 1, device=self.device) * 2.0 * np.pi
             )

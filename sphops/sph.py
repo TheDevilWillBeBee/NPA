@@ -33,17 +33,13 @@ def _default_mass(x, mass):
     return mass
 
 
-def get_hashgrid_cls(dim, boundary, mode):
+def get_hashgrid_cls(dim, boundary):
     return {
-        (2, "periodic", "grid"): sph_cuda.HashGrid2DPeriodic,
-        (3, "periodic", "grid"): sph_cuda.HashGrid3DPeriodic,
-        (2, "clamped", "grid"): sph_cuda.HashGrid2DBox,
-        (3, "clamped", "grid"): sph_cuda.HashGrid3DBox,
-        (2, "periodic", "particle"): sph_cuda.VHashGrid2DPeriodic,
-        (3, "periodic", "particle"): sph_cuda.VHashGrid3DPeriodic,
-        (2, "clamped", "particle"): sph_cuda.VHashGrid2DBox,
-        (3, "clamped", "particle"): sph_cuda.VHashGrid3DBox,
-    }[(dim, boundary, mode)]
+        (2, "periodic"): sph_cuda.HashGrid2DPeriodic,
+        (3, "periodic"): sph_cuda.HashGrid3DPeriodic,
+        (2, "clamped"): sph_cuda.HashGrid2DBox,
+        (3, "clamped"): sph_cuda.HashGrid3DBox,
+    }[(dim, boundary)]
 
 
 @dataclass
@@ -53,13 +49,15 @@ class HashGridSnapshot:
     permutation: torch.Tensor
     block_info: torch.Tensor
     dim: int
-    mode: str = "grid"
 
 
 class HashGrid:
     """
     A class to manage a spatial hash grid for particle simulations.
     This class supports both 2D and 3D grids with periodic or clamped boundary conditions.
+    Kernels run one thread block per occupied cell, or several when a cell holds
+    more than max_particles_per_block particles. mode is accepted for existing
+    configs; "grid" is the only mode.
     """
 
     def __init__(
@@ -82,13 +80,12 @@ class HashGrid:
         self.batch_size = batch_size
         self.max_particles_per_block = max_particles_per_block
 
-        # if mode == "particle" then grid_size must be a power of 2
-        if mode == "particle":
-            for size in grid_size:
-                assert (size & (size - 1)) == 0, "grid_size must be a power of 2"
+        if mode != "grid":
+            raise ValueError(f'HashGrid mode {mode!r} is not supported; only mode="grid" exists. '
+                             'Particle mode was removed after git tag particle-mode-last (commit c5cf88d).')
 
         self.num_cells = math.prod(grid_size)
-        self.hashgrid_cls = get_hashgrid_cls(dim, boundary, mode)
+        self.hashgrid_cls = get_hashgrid_cls(dim, boundary)
         self.hashgrid = self.hashgrid_cls(
             *grid_size, eps, num_particles, batch_size, max_particles_per_block
         )
@@ -119,7 +116,6 @@ class HashGrid:
             permutation=permutation,
             block_info=block_info,
             dim=self.dim,
-            mode=self.mode,
         )
     
     def wrap_positions(self, x):
@@ -519,8 +515,7 @@ def _native_channel_count(channels):
 def fused_perception_supported(x, s, grid, mass=None):
     """Whether fused_perception accepts these inputs (otherwise use perception())."""
     return (
-        grid.mode == "grid"
-        and hasattr(grid.hashgrid, "fused_perception_forward")
+        hasattr(grid.hashgrid, "fused_perception_forward")
         and x.is_cuda
         and s.device == x.device
         and x.dtype == s.dtype == torch.float32
@@ -640,7 +635,7 @@ def fused_perception(x, s, grid, eps0, *, mass=None, perceive_state=True, densit
     offsets = blocks + B * grid.num_cells + 1
     snapshot = HashGridSnapshot(
         grid=grid.hashgrid, bin_offsets=buffer[blocks:offsets], permutation=buffer[offsets:].view(B, N),
-        block_info=buffer[:blocks].view(-1, 4), dim=grid.dim, mode=grid.mode,
+        block_info=buffer[:blocks].view(-1, 4), dim=grid.dim,
     )
     return z, x_bin, s_bin, snapshot
 

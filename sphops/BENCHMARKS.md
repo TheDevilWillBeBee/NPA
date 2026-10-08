@@ -251,7 +251,7 @@ recorded before that cleanup.
 
 | Change | Where | Effect |
 | --- | --- | --- |
-| Lane-per-particle density/forward/backward with neighbor-tile warp teams | `perception.cuh` | Dense disk C=16: 8.4x fewer warp instructions forward and 6.4x backward; NCU duration at base clocks 2.58 -> 0.38 ms forward, 2.46 -> 0.38 ms backward, 134 -> 99 us density |
+| Lane-per-particle density/forward/backward with neighbor-tile warp teams | `fused_perception.cuh` | Dense disk C=16: 8.4x fewer warp instructions forward and 6.4x backward; NCU duration at base clocks 2.58 -> 0.38 ms forward, 2.46 -> 0.38 ms backward, 134 -> 99 us density |
 | No CUDA separable compilation | `CMakeLists.txt` | Removes ptxas spills in the new kernels (up to 468 B per thread) |
 | Grid build: arrival ranks, fewer memsets, stream-ordered | `sph_cuda.cu` | 9 instead of 14 launches per `initialize` |
 | One autograd function for grid build, binning, and perception | `sph.py`, `models/npa.py` | About 200 us less host time per training step (forward+backward) |
@@ -341,7 +341,7 @@ With the current kernels, cap 32 has the lowest absolute C=16 latency (forward
 a dense ball seed improves 4.80x forward / 6.54x backward. A sparse uniform
 cube with about 4 particles per cell improves only 1.99x / 2.63x (1.32x /
 1.99x at C=32), because most lanes of each grid block's warps are idle. The 3D
-training config uses particle mode, which does not use the fused path.
+training config now uses grid mode too; see the 3D section below.
 
 ### Matched graft training (300 updates, B=8, N=4096, C=16, cap 32)
 
@@ -423,3 +423,270 @@ by about 0.25 GiB; texture peak memory fell.
 
 Isolated-build and A/B scripts used for these measurements are local in
 `results/kernel_opt_20261007/` and are not source-controlled.
+
+## 3D growing config and particle-mode removal (2026-10-08)
+
+`configs/growing-3dgs.yaml` used `mode: "particle"` (thread per particle,
+Morton order, standalone operators only). On its ball seed (B=4, N=16384,
+C=16, 32^3 grid, eps 0.1, cap 64; about 3.7 particles per occupied cell and
+16.5 neighbors within eps), medians of 9 interleaved rounds on the RTX 4090:
+
+| Workload (ms) | Particle mode | Grid, unfused | Grid, fused |
+| --- | ---: | ---: | ---: |
+| Perception forward / backward | 1.75 / 1.57 | 1.62 / 1.03 | 0.50 / 0.36 |
+| NPA step forward / backward | 2.15 / 2.32 | 2.18 / 1.79 | 1.04 / 1.09 |
+| 24-step rollout forward / backward | 52.2 / 53.2 | 52.6 / 40.8 | 25.2 / 26.2 |
+| Rollout peak memory | 4290 MiB | 4312 MiB | 3517 MiB |
+
+The rollout loss is the config's regularizers plus mean(decoded^2) in place of
+the Gaussian-splat render (the lego data is not in the repository); rendering
+costs the same in every mode. All three modes agree to about 3e-7 relative L2
+in perception outputs and state adjoints.
+
+Particle mode was then removed: the `KernelStrategy` template parameter, the
+`vanilla_*` kernels, Morton hashing, and the `VHashGrid*` classes. `HashGrid`
+still accepts `mode="grid"` for existing configs and rejects other modes with
+a pointer to git tag `particle-mode-last` (commit c5cf88d), the last version
+with particle mode. The 3D config now uses grid mode.
+
+- Grid mode is unchanged: the 126 remaining kernels have identical SM89 SASS
+  to the same kernels before the removal, and binning, every standalone
+  operator (forward and backward), legacy perception and fused perception
+  (unit and explicit masses) are bitwise identical in 2D/3D, both boundaries,
+  power-of-two and other grid sizes, C = 5/16.
+- `test_perception` (14 CPU + 15 CUDA), `test_pipeline` (6 CPU + 8 CUDA) and
+  `testing/test.py` pass.
+
+| Default build (`75 80 86 89`) | With particle mode | Grid only |
+| --- | ---: | ---: |
+| Compile time | 178.7 s | 99.9 s |
+| Peak compiler memory | 2.94 GB | 1.89 GB |
+| Kernels per architecture | 290 | 126 |
+| SM89 cubin / PTX (uncompressed) | 15.9 / 11.3 MB | 6.5 / 4.9 MB |
+| Extension size | 12.03 MB | 7.88 MB |
+
+fatbinary compresses only large cubins by default. The smaller grid-only
+cubins were stored uncompressed (a 30.0 MB extension), so `CMakeLists.txt` now
+passes `-Xfatbin=-compress-all`; cubins were already stored compressed before.
+
+Scripts and raw results are local in `results/fused_3d_ball_20261008/` and
+`results/remove_particle_mode_20261008/` and are not source-controlled.
+
+## Coalesced forward output (2026-10-08)
+
+Nsight Compute flagged uncoalesced global accesses in the fused kernels. Changes:
+forward stages its output and `gradient_values` rows in shared memory and writes
+them coalesced, and loads each particle's own state as `float4`. Fused outputs and
+adjoints stay bitwise identical (one particle per cell: binning, all standalone
+operators, legacy and fused perception, 2D/3D, both boundaries, C = 5/16). With
+dense and multi-pass blocks (caps 64/128, C = 5/16/32, unit and explicit masses),
+the old/new difference equals the run-to-run binning-order noise (relative L2
+≤ 1.2e-6). Racecheck, synccheck, memcheck and initcheck report no errors. The 3D
+forward kernels with 16/32 channels gained a 16-byte stack frame (four spills,
+outside the neighbor loop); shared memory is unchanged.
+
+Kernel durations (NCU, locked base clocks, median of 5; B=8, N=4096, C=16, cap 32
+in 2D; 3D is the `growing-3dgs.yaml` ball seed):
+
+| Case | `forward` before → after | All four fused kernels |
+| --- | ---: | ---: |
+| emoji_lizard | 123.1 → 97.8 µs (1.26x) | 239.0 → 212.2 µs (1.13x) |
+| texture_seed | 178.1 → 141.9 µs (1.26x) | 369.9 → 338.0 µs (1.09x) |
+| texture_bubbly | 158.5 → 141.5 µs (1.12x) | 355.0 → 341.5 µs (1.04x) |
+| growing_seed (dense disk) | 391.6 → 382.8 µs (1.02x) | 894.7 → 882.4 µs (1.01x) |
+| ball_3d | 465.7 → 464.8 µs (1.00x) | 976.3 → 961.1 µs (1.02x) |
+
+In the forward kernel, stores now use 26-27 of 32 bytes per sector (was 4). L2
+throughput fell from 66% to 12% (lizard) and from 32% to 13% (3D ball). The 3D
+and dense-seed kernels were not limited by these stores. Their remaining limits
+are register-bound occupancy (128 registers, 33% theoretical) and idle lanes
+(about 15 of 32 active), which come from the lane-per-particle design. Over the
+12-target corpus, the end-to-end perception forward latency improved by 1.11x on
+average. Backward and the NPA step were unchanged within run-to-run noise
+(4-7%).
+
+Backward stages its `grad_state` row updates the same way, so both kernels use
+one output pattern. It measured neutral there (-3% to +4% by case) and stays
+bitwise identical: the copy applies `fmaf(volume, sum, row)`, the rounding of the
+former per-lane `+=`.
+
+`backward_prepare` is unchanged: it already moves its minimum traffic at DRAM
+bandwidth. It reads 13.2 MB for a 13.1 MB minimum in 2D and 36.4 MB for 35.1 MB
+in 3D, at 0.8-0.9 TB/s. Its "uncoalesced" message describes per-instruction L1
+sector use.
+
+### Unpadded 3D positions
+
+3D positions are now `[B,N,3]` everywhere (`ParticlePosition<3>` holds a
+`float3`), instead of a `float4` with a zero fourth component. The padding had
+leaked into `Pool`, both Euler steps, the compiled update, the 3D splat loss,
+and `HashGrid.wrap_positions`, which returned three columns in 3D periodic mode.
+It also put a zero column into `bound_regularizer`'s mean, which scaled that term
+by 3/4 in 3D; the configured weight now applies as written.
+
+- Bitwise A/B against the padded build, one particle per cell: 696/696 tensors
+  identical. They cover binning, all standalone operators with position
+  gradients, legacy and fused perception with gradients through binning, and an
+  NPA step, in 2D/3D, both boundaries, C = 5/16, with unit and explicit masses.
+  Every padded position tensor of the old build had an all-zero fourth column.
+- Dense and multi-pass blocks: old/new difference ≤ 7e-7 relative L2, the same
+  as the run-to-run binning-order noise.
+- The standalone operators pass the PyTorch reference in 3D, forward and
+  backward. Racecheck, synccheck, memcheck and initcheck report no errors.
+- NCU kernel time over the whole fused path (binning included, 5 repeats): 2D
+  cases are within ±3%. The 3D ball improves from 1010 to 989 µs; the fused
+  kernels go from 940 to 919 µs. `apply_permutation` is the only slower kernel
+  (13.1 → 15.7 µs): a 12-byte position copies as three scalar moves.
+- Random draws shaped like positions now have three columns in 3D: position
+  noise and the `gaussian`/`uniform` seeds. Seeded 3D runs therefore draw
+  different numbers.
+
+Scripts and reports are local in `results/padding_experiment_20261008/` and
+`results/remove_particle_mode_20261008/`.
+
+### Code cleanup
+
+Duplicated code was merged, and `sph_cuda.cu`, `fused_perception.cuh` and
+`utils.cuh` went from 4081 to 3387 lines:
+- The neighbor spans are `GridConfig::neighbor_row`, `row_x_range` and
+  `neighbor_span` in `utils.cuh`.
+- The fused kernels walk tiles with one `for_each_neighbor`.
+- One `safe_inverse_symmetric` serves the fused kernel and `safe_inv_sym_mat`,
+  through a single templated kernel.
+- The standalone operators use shared launch helpers (`OperatorArgs`,
+  `launch_forward`, `launch_backward`), shape helpers (`per_particle`,
+  `operator_args`) and a `RowSplit` index helper.
+- The binning kernels share `copy_row` and `GridConfig::cell_hash`.
+- `_init` sets the grid sizes, and the fused entry points use `snapshot_view`.
+- Unused position operators and power helpers were removed.
+
+Checks:
+- Bitwise identical to the previous build: 696/696 tensors (2D/3D, both
+  boundaries, C = 5/16, unit and explicit masses, all standalone forward and
+  backward operators, legacy and fused perception, an NPA step).
+- Dense and multi-pass blocks differ by at most 1e-6 relative L2, the
+  run-to-run binning noise.
+- The standalone operators pass the PyTorch reference in 2D and 3D.
+- Racecheck, memcheck, initcheck and synccheck report no errors.
+- NCU kernel time is unchanged within noise: standalone operators 1.00-1.03x,
+  fused path 1.01-1.05x (2D lizard, texture seed, 3D ball, and more).
+
+The standalone kernels compute each row's span inline from `neighbor_row` and
+`row_x_range` instead of calling `neighbor_span`. In those block-wide kernels,
+the call raised register counts (3D gradient backward from 48 to 54) and made
+the 2D periodic moment-matrix forward 44% slower, although the arithmetic was
+identical. The inline form measures the same as before.
+
+## Second optimization round (2026-10-08, after the cleanup)
+
+Profiling the cleaned-up kernels with Nsight Compute (stall reasons, SASS-level
+instruction counts) pointed at four things: global-load and barrier stalls in
+the sparse forward, `fmodf` in every periodic displacement, shared-load stalls
+in the backward, and 65,536 launched CUDA blocks in 3D of which 73% only read
+an empty record. The changes, all in `fused_perception.cuh`, `sph_cuda.cu` and
+`utils.cuh`:
+
+| Change | Effect |
+| --- | --- |
+| Two tile buffers per warp; tiles copied with `cp.async` (global to shared, one commit group per tile) while the previous tile is processed; backward tiles of 8 candidates so that two buffers fit the shared-memory budget | Backward: shape −10%, dense −8%, 3D −18%; forward: dense −5%, 3D −9% (locked clocks) |
+| Persistent neighbor kernels: a CUDA block loops over block records with stride `gridDim.x` and stops at the first zero-count sentinel; launch = min(records, 8 waves of resident blocks) | 3D ball: forward −3%, backward −4%, density −4%; 2D unchanged (launch size unchanged) |
+| Periodic wrap `d - L * rint(d / L)` instead of `fmodf` | Periodic cases: density −48%, forward −20%, backward −10% |
+| Volume-weighted weights computed once per pair: 4 instead of 5 floating-point instructions per channel in 2D (exact `(s_j - s_i)` form kept) | Dense forward −3%, periodic forward −6% |
+| Team reduction in one chunk (staging up to 21 KB), both output row sets staged behind one barrier, no barrier after the last particle chunk | Part of the forward gains above; 4 block barriers per grid block instead of 10 |
+| Scatter fused with binning, sentinel tail written by the record kernel, one zipped scan for both prefix sums, `float4` unbinning | 12 → 8 launches per fused forward; unbinning 13 → 5 µs (2D), 27 → 9 µs (3D) |
+
+Nsight Compute kernel durations at locked base clocks (one profiled call per
+build; the atomic binning order differs between processes and moves the times
+of identical code by up to about 5%), B=8, N=4096, C=16, cap 32 in 2D; 3D is
+the `growing-3dgs.yaml` ball seed (B=4, N=16384, cap 64):
+
+| Case | `forward` | `backward` | `density_forward` |
+| --- | ---: | ---: | ---: |
+| growing_seed (dense disk, clamped) | 379.2 → 352.6 µs | 393.7 → 353.0 µs | 97.9 → 102.7 µs |
+| texture_seed (uniform, periodic) | 142.4 → 106.0 µs | 115.8 → 104.1 µs | 61.1 → 31.6 µs |
+| emoji_lizard (shape, clamped) | 95.0 → 90.3 µs | 78.5 → 74.6 µs | 21.6 → 22.5 µs |
+| ball_3d (clamped) | 466.0 → 395.4 µs | 328.3 → 258.1 µs | 131.7 → 115.1 µs |
+
+Kernel time per `fused_perception` call (CUPTI sum of all kernels of the call,
+including grid build, binning and unbinning; normal clocks; three interleaved
+fresh-process rounds per build, C=16):
+
+| Case | Forward | Backward |
+| --- | ---: | ---: |
+| growing_seed | 427-496 → 396-407 µs | 340-373 → 310-332 µs |
+| texture_seed | 183 → 132 µs | 117 → 94 µs |
+| emoji_lizard | 113-128 → 105 µs | 81 → 67 µs |
+| emoji_fox | 92 → 86 µs | 64 → 52 µs |
+| texture_bubbly | 182-209 → 130 µs | 118 → 92 µs |
+| texture_banded | 166-175 → 119-137 µs | 104 → 84 µs |
+| ball_3d | 526-585 → 447-466 µs | 321-344 → 245-257 µs |
+
+Correctness:
+
+- `test_perception` (14 CPU + 29 CUDA), `test_pipeline` (14) and the
+  standalone `testing/test.py` suite pass. Compute Sanitizer memcheck,
+  synccheck and initcheck report 0 errors; racecheck (fused, grid and binning
+  kernels, all reports) 0 hazards.
+- Against the build before this round, on the corpus plus 3D ball/cube cases
+  (C = 5/16/32, unit and explicit masses, outputs and state adjoints compared
+  in original particle order): relative L2 at most 3.3e-6, all finite. The
+  largest differences are periodic cases, where the wrap no longer rounds
+  `d + L/2`; one-particle-per-cell cases differ by at most 7.7e-7.
+- On states from a 40-step rollout of the pretrained lizard model (B=2), the
+  forward and the state adjoint of both the old and the new build agree with a
+  float64 dense reference (`sphops/testing/torch_sph`) to 1.3e-7 (gradient
+  features), 4.3e-7 (density gradient) and 3.5e-7 (adjoint) relative L2.
+
+Matched 300-update graft training (`benchmark_training`, current configs, so
+the emoji run uses `compile_step`), before → after this round:
+
+| Run | Timed updates | Rollout forward | Backward | Peak allocated |
+| --- | ---: | ---: | ---: | ---: |
+| Emoji fox, run 1 | 20.05 → 19.86 s | 9.09 → 8.91 s | 8.57 → 8.53 s | 5.07 GiB both |
+| Emoji fox, run 2 | 20.14 → 19.74 s | 9.13 → 8.79 s | 8.59 → 8.53 s | 5.07 GiB both |
+| Texture bubbly | 14.42 → 14.17 s | 3.38 → 3.29 s | 7.99 → 7.84 s | 2.41 GiB both |
+
+The kernel-level gains of 10-25% become 1.5-2% of a training update: the step
+is host-launch bound and fused perception is a minor part of its GPU time (see
+the previous section). Losses stay within run-to-run variation (fox last-25
+mean 1.173 / 1.253 before, 1.169 / 1.237 after; bubbly 2.371 before, 2.362
+after). Further end-to-end gains need fewer launches per step (CUDA graphs, or
+fusing the MLP and Euler update with the perception call), not faster
+perception kernels.
+
+Rejected experiments, same measurement:
+
+- Centering the tile states on the block's first particle's state (3 instead of
+  4 floating-point instructions per channel): dense forward another −5%, but
+  gradient features 1.7e-7 instead of 1.35e-7 relative L2 from the float64
+  reference (cancellation of `s_i * sum(v gradW)`), so the exact form was kept.
+- `FORWARD_RESIDENT_WARPS = 20` (96 registers, no spills, 20 warps/SM):
+  dense forward +12%, periodic +13%.
+- Balanced contiguous candidate ranges per team instead of round-robin tiles,
+  plus the epilogue split over the four teams: fewer barrier stalls but +20%
+  instructions (a second pass over the spans, partial tiles); forward +17%
+  shape, +40% 3D. The SASS profile shows the epilogue at about 2% of the sparse
+  forward, so there was little to parallelize.
+- Software-pipelined inner loop (displacement of candidate j+1 issued before
+  the pair work of j): 2D forward −3 to −6%, but backward +5 to +9%, density
+  +5%, 3D forward +4%; not kept.
+- `BACKWARD_RESIDENT_WARPS = 24` (80 registers): dense +3%, periodic −6%, 3D
+  −3%; neutral, not kept.
+- Greedy count-balanced tile assignment (each tile to the team with the fewest
+  candidates): the per-team load counters indexed dynamically spilled to local
+  memory; density up to 3.5x slower; not kept.
+- Persistent grid of two waves instead of eight: sparse 2D forward +5% (the
+  hardware scheduler balances 3,072 short blocks better than 1,024 looping
+  ones).
+
+Full Nsight Compute reports of the final kernels (`--set full`, locked base
+clocks, one `fused_perception` forward + backward on the dense disk and on the
+emoji_lizard target, installed extension rebuilt from these sources for all
+four architectures) are in `sphops/ncu_reports/fused_round2_20261008/`, with
+the profiling script next to them. Open them with
+`ncu --import <report> --page details` or in the Nsight Compute UI.
+
+Scripts and raw results of this round (A/B timing, numerical comparison,
+trained-state validation, Nsight exports of the intermediate variants) are
+local in `results/kernel_opt_20261008/` and in the session scratch directory;
+they are not source-controlled.

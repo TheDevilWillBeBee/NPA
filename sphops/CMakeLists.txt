@@ -42,10 +42,13 @@ nanobind_add_module(sph_cuda sph_cuda.cu)
 # (relocatable builds spill in the fused perception kernels).
 set_property(TARGET sph_cuda PROPERTY CUDA_SEPARABLE_COMPILATION OFF)
 
-target_compile_options(sph_cuda PRIVATE 
+target_compile_options(sph_cuda PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-g>
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     $<$<COMPILE_LANGUAGE:CUDA>:-src-in-ptx>
+    # fatbinary compresses only large cubins by default; ours (~6.5 MB each,
+    # mostly line info and embedded PTX source) would be stored uncompressed.
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all>
 )
 
 

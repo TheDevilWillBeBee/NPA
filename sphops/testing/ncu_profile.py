@@ -112,15 +112,12 @@ with torch.no_grad():
     )
 
     if dim != 2:
-        # Keep non-2D benchmark shapes compatible with previous behavior.
-        extra = torch.randn(B, N, 2, device=device) * sigma * 0.5
+        # The image gives x and y; add random z coordinates for 3D.
+        extra = torch.randn(B, N, dim - 2, device=device) * sigma * 0.5
         x = torch.cat([x, extra], dim=-1)
 
     print(x.shape)
     s = torch.randn(B, N, C, device=device)
-
-    # mode = "particle"
-    mode = "grid"
 
     boundary = "clamped"
     # boundary = "periodic"
@@ -128,7 +125,6 @@ with torch.no_grad():
     grid = HashGrid(
         dim=dim,
         boundary=boundary,
-        mode=mode,
         grid_size=[grid_size] * dim,
         eps=eps,
         num_particles=N,

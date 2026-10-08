@@ -37,7 +37,7 @@ class CPUPerceptionTests(unittest.TestCase):
         position = torch.zeros(1, 3, 2)
         raw_gradient = torch.arange(48, dtype=torch.float32).reshape(1, 3, 8, 2) / 10
         density_gradient = torch.arange(6, dtype=torch.float32).reshape(1, 3, 2) / 10
-        snapshot = SimpleNamespace(grid=SimpleNamespace(eps=0.1), dim=2, mode="grid")
+        snapshot = SimpleNamespace(grid=SimpleNamespace(eps=0.1), dim=2)
         eps0 = torch.tensor([0.2])
         # Omitted masses total N = 3; explicit masses divide by their own total.
         masses = ((None, 3), (torch.tensor([[0.5, 1.0, 2.5]]), 4))
@@ -67,8 +67,13 @@ class CPUPerceptionTests(unittest.TestCase):
 
     def test_cpu_inputs_are_not_reported_as_fused_supported(self):
         from sphops import fused_perception_supported
-        grid = SimpleNamespace(mode="grid", hashgrid=SimpleNamespace(fused_perception_forward=object()))
+        grid = SimpleNamespace(hashgrid=SimpleNamespace(fused_perception_forward=object()))
         self.assertFalse(fused_perception_supported(torch.zeros(1, 3, 2), torch.zeros(1, 3, 16), grid))
+
+    def test_removed_particle_mode_is_rejected(self):
+        from sphops import HashGrid
+        with self.assertRaisesRegex(ValueError, "particle-mode-last"):
+            HashGrid(dim=3, boundary="clamped", mode="particle", grid_size=[32, 32, 32])
 
     def test_fused_channel_buckets_and_unsupported_sizes(self):
         from sphops.sph import _native_channel_count
@@ -86,8 +91,8 @@ class CPUPerceptionTests(unittest.TestCase):
             with self.subTest(dim=dim, channels=channels, density_grad=density_grad):
                 B, N = 1, 3
                 state = torch.randn(B, N, channels, requires_grad=True)
-                position = torch.zeros(B, N, 2 if dim == 2 else 4)
-                grid = SimpleNamespace(dim=dim, mode="grid", num_cells=4,
+                position = torch.zeros(B, N, dim)
+                grid = SimpleNamespace(dim=dim, num_cells=4,
                                        hashgrid=SimpleNamespace(max_blocks=2))
                 captured = {}
                 def fake_native(x, padded, mass, grid, eps0, density_grad, *flags):
@@ -132,7 +137,7 @@ class CPUPerceptionTests(unittest.TestCase):
     def test_fixed_mass_validation_and_legacy_argument_propagation(self):
         from sphops import sph
         x, state = torch.zeros(1, 3, 2), torch.zeros(1, 3, 4)
-        snapshot = SimpleNamespace(grid=SimpleNamespace(eps=0.1), dim=2, mode="grid")
+        snapshot = SimpleNamespace(grid=SimpleNamespace(eps=0.1), dim=2)
         eps0 = torch.tensor([0.1])
         for mass in (torch.ones(1, 2), torch.ones(1, 3, dtype=torch.float64),
                      torch.ones(1, 3, requires_grad=True)):
@@ -325,8 +330,6 @@ class CUDAPerceptionTests(unittest.TestCase):
         generator = torch.Generator(device="cuda").manual_seed(42)
         x = torch.rand(2, 96, dim, generator=generator, device="cuda")
         x = (x - 0.5) * (0.3 if dense else size * 0.1)
-        if dim == 3:
-            x = torch.cat([x, torch.zeros_like(x[..., :1])], -1)
         state = torch.randn(2, 96, channels, generator=generator, device="cuda") * 0.1
         grid = HashGrid(dim=dim, boundary=boundary, mode="grid", grid_size=[size] * dim,
                         eps=0.1, num_particles=96, batch_size=2, max_particles_per_block=cap)

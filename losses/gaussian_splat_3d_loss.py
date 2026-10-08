@@ -18,7 +18,7 @@ def get_gaussian_properties_old(pos, state, **configs):
     max_anisotropy = configs.get("max_anisotropy", 3.0)
     opacity_scale = configs.get("opacity_scale", 1.0)
 
-    means = pos[..., :3]
+    means = pos
 
     colors_dim_start = 3 if sh_degrees is None else ((sh_degrees + 1) ** 2) * 3
     colors = state[..., -colors_dim_start:]
@@ -49,7 +49,7 @@ def get_gaussian_properties(pos, state, **configs):
     max_anisotropy = configs.get("max_anisotropy", 3.0)
     opacity_scale = configs.get("opacity_scale", 1.0)
 
-    means = pos[..., :3]
+    means = pos
 
     colors_dim_start = 3 if sh_degrees is None else ((sh_degrees + 1) ** 2) * 3
     colors = state[..., -colors_dim_start:]
@@ -61,11 +61,11 @@ def get_gaussian_properties(pos, state, **configs):
 
     if max_anisotropy == 0.0:
         # isotropic case
-        rotations = torch.zeros_like(pos[..., :4])
+        rotations = pos.new_zeros(*pos.shape[:-1], 4)
         rotations[...,0] = 1.0  # w=1, x=y=z=0
-        scales = s_iso * torch.ones_like(pos[..., :3])
+        scales = s_iso * torch.ones_like(pos)
         opacities = torch.ones_like(pos[..., 0]) * opacity_scale
-        log_anisotropy = torch.zeros_like(pos[..., :4])
+        log_anisotropy = pos.new_zeros(*pos.shape[:-1], 4)
     else:
         rotations_dim_start = colors_dim_start + 4
         rotations = state[..., -rotations_dim_start:-colors_dim_start]
